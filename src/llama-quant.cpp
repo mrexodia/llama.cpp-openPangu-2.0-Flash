@@ -322,6 +322,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("ssm_conv1d") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
+    // openPangu-2.0: keep MoME convs, mHC phi/scale/base, and param sinks unquantized
+    quantize &= name.find("_conv.weight")  == std::string::npos;
+    quantize &= name.find("attn_sink_")    == std::string::npos;
+    quantize &= name.find("hc_attn")       == std::string::npos;
+    quantize &= name.find("hc_ffn")        == std::string::npos;
+    quantize &= name.find("output_hc")     == std::string::npos;
+
     // do not quantize RWKV's small yet 2D weights
     quantize &= name.find("time_mix_first.weight") == std::string::npos;
     quantize &= name.find("time_mix_w0.weight") == std::string::npos;

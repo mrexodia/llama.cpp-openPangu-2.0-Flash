@@ -180,6 +180,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "PLaMo3ForCausalLM": "plamo",
     "PaddleOCRVLForConditionalGeneration": "ernie",
     "PanguEmbeddedForCausalLM": "pangu",
+    "OpenPanguV2ForCausalLM": "pangu",
     "Phi3ForCausalLM": "phi",
     "Phi4ForCausalLMV": "phi",
     "PhiForCausalLM": "phi",

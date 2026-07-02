@@ -474,6 +474,15 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_fn    = nullptr;
     struct ggml_tensor * hc_ffn_base  = nullptr;
     struct ggml_tensor * hc_ffn_scale = nullptr;
+
+    // openPangu-2.0 (openpangu-v2)
+    struct ggml_tensor * attn_q_a_conv  = nullptr;
+    struct ggml_tensor * attn_kv_a_conv = nullptr;
+    struct ggml_tensor * attn_o_conv    = nullptr;
+    struct ggml_tensor * attn_sink_kv   = nullptr;
+    struct ggml_tensor * attn_sink_k_pe = nullptr;
+    struct ggml_tensor * block_post_norm = nullptr;
+
     struct ggml_tensor * attn_comp_wkv   = nullptr;
     struct ggml_tensor * attn_comp_wgate = nullptr;
     struct ggml_tensor * attn_comp_ape   = nullptr;

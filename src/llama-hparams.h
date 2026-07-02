@@ -237,6 +237,10 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    // openPangu-2.0 (openpangu-v2)
+    uint32_t openpangu_n_sink = 0;   // learned param-sink KV entries per layer
+    uint32_t openpangu_conv_k = 0;   // MoME causal conv kernel width
+
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
     // N deepstack embeddings. Use deepstack_mapping_arr if you need a more

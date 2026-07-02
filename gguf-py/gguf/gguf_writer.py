@@ -793,6 +793,15 @@ class GGUFWriter:
     def add_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
 
+    def add_sink_count(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.SINK_COUNT.format(arch=self.arch), count)
+
+    def add_conv_kernel_size(self, size: int) -> None:
+        self.add_uint32(Keys.Attention.CONV_KERNEL_SIZE.format(arch=self.arch), size)
+
+    def add_layer_swa_window(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.LAYER_SWA_WINDOW.format(arch=self.arch), values)
+
     def add_max_alibi_bias(self, bias: float) -> None:
         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
 

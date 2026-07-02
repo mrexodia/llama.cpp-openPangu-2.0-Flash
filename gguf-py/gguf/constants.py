@@ -195,6 +195,9 @@ class Keys:
         SHARED_KV_LAYERS             = "{arch}.attention.shared_kv_layers"
         SLIDING_WINDOW_PATTERN       = "{arch}.attention.sliding_window_pattern"
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
+        SINK_COUNT                   = "{arch}.attention.sink_count"
+        CONV_KERNEL_SIZE             = "{arch}.attention.conv_kernel_size"
+        LAYER_SWA_WINDOW             = "{arch}.attention.layer_swa_window"
 
         class Indexer:
             HEAD_COUNT = "{arch}.attention.indexer.head_count"
@@ -527,6 +530,7 @@ class MODEL_ARCH(IntEnum):
     MINIMAXM2        = auto()
     RND1             = auto()
     PANGU_EMBED      = auto()
+    OPENPANGU_V2     = auto()
     MISTRAL3         = auto()
     EAGLE3           = auto()
     DFLASH           = auto()
@@ -706,6 +710,12 @@ class MODEL_TENSOR(IntEnum):
     HC_FFN_FN            = auto()
     HC_FFN_BASE          = auto()
     HC_FFN_SCALE         = auto()
+    ATTN_Q_A_CONV        = auto() # openpangu-v2 MoME short conv
+    ATTN_KV_A_CONV       = auto()
+    ATTN_O_CONV          = auto()
+    ATTN_SINK_KV         = auto() # openpangu-v2 learned param-sink compressed kv
+    ATTN_SINK_K_PE       = auto()
+    BLOCK_POST_NORM      = auto() # openpangu-v2 mHC stream post-norm
     ATTN_COMPRESSOR_WKV  = auto()
     ATTN_COMPRESSOR_WGATE = auto()
     ATTN_COMPRESSOR_APE  = auto()
@@ -1108,6 +1118,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.COGVLM:           "cogvlm",
     MODEL_ARCH.RND1:             "rnd1",
     MODEL_ARCH.PANGU_EMBED:      "pangu-embedded",
+    MODEL_ARCH.OPENPANGU_V2:     "openpangu-v2",
     MODEL_ARCH.MISTRAL3:         "mistral3",
     MODEL_ARCH.EAGLE3:           "eagle3",
     MODEL_ARCH.DFLASH:           "dflash",
@@ -1285,6 +1296,12 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
     MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
     MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
+    MODEL_TENSOR.ATTN_Q_A_CONV:             "blk.{bid}.attn_q_a_conv",
+    MODEL_TENSOR.ATTN_KV_A_CONV:            "blk.{bid}.attn_kv_a_conv",
+    MODEL_TENSOR.ATTN_O_CONV:               "blk.{bid}.attn_o_conv",
+    MODEL_TENSOR.ATTN_SINK_KV:              "blk.{bid}.attn_sink_kv",
+    MODEL_TENSOR.ATTN_SINK_K_PE:            "blk.{bid}.attn_sink_k_pe",
+    MODEL_TENSOR.BLOCK_POST_NORM:           "blk.{bid}.block_post_norm",
     MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_kv",
     MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_gate",
     MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
@@ -3230,6 +3247,53 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_TID2EID,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
         MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+    ],
+    MODEL_ARCH.OPENPANGU_V2: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.HC_HEAD_FN,
+        MODEL_TENSOR.HC_HEAD_BASE,
+        MODEL_TENSOR.HC_HEAD_SCALE,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.BLOCK_POST_NORM,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_Q_A_CONV,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_KV_A_CONV,
+        MODEL_TENSOR.ATTN_K_B,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_O_CONV,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_SINK_KV,
+        MODEL_TENSOR.ATTN_SINK_K_PE,
+        MODEL_TENSOR.INDEXER_K_NORM,
+        MODEL_TENSOR.INDEXER_PROJ,
+        MODEL_TENSOR.INDEXER_ATTN_K,
+        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
         MODEL_TENSOR.FFN_UP_EXP,
