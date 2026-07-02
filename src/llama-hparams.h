@@ -241,6 +241,10 @@ struct llama_hparams {
     uint32_t openpangu_n_sink = 0;   // learned param-sink KV entries per layer
     uint32_t openpangu_conv_k = 0;   // MoME causal conv kernel width
 
+    // reserved always-visible rows at the head of each K cache stream slice
+    // (learned attention sinks live there; K-only/MLA caches only)
+    uint32_t n_k_sink_prefix = 0;
+
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
     // N deepstack embeddings. Use deepstack_mapping_arr if you need a more

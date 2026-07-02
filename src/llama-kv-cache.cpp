@@ -244,7 +244,14 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        // reserved always-visible rows at the head of each K stream slice (attention sinks)
+        const uint32_t n_k_prefix = hparams.n_k_sink_prefix;
+        if (n_k_prefix > 0) {
+            GGML_ASSERT(n_stream == 1 && "K sink prefix requires a unified KV cache");
+            GGML_ASSERT(!has_v     && "K sink prefix is only supported for K-only (MLA) caches");
+        }
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size + n_k_prefix, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
@@ -254,7 +261,8 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            // the per-stream cell region starts after the reserved sink prefix rows
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2] + n_k_prefix*k->nb[1]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
@@ -1267,19 +1275,23 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
+
+    // per-stream slice: [n_k_sink_prefix reserved rows | kv_size cell rows]
+    const uint64_t slice_size  = k->ne[1];
+    const uint32_t n_k_prefix  = hparams.n_k_sink_prefix;
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    // the view starts at the sink prefix so attention sees [sinks | cells] contiguously
     return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv + n_k_prefix, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*slice_size),
+            ggml_row_size(k->type, n_embd_k_gqa*slice_size)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1333,9 +1345,13 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
-    const int64_t n_stream = k->ne[2];
+    const int64_t  n_stream   = k->ne[2];
+    const uint32_t n_k_prefix = hparams.n_k_sink_prefix;
 
-    if (n_stream > 1) {
+    if (n_k_prefix > 0) {
+        // cell rows start after the reserved sink prefix (n_stream == 1, asserted at init)
+        k = ggml_view_2d(ctx, k, n_embd_gqa, get_size(), k->nb[1], n_k_prefix*k->nb[1]);
+    } else if (n_stream > 1) {
         const int64_t kv_size = get_size();
 
         assert(n_embd_gqa == k->ne[0]);
@@ -1969,6 +1985,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
                 n_rot, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
+                // cell rows start after the reserved sink prefix (n_stream == 1 when prefix > 0)
+                hparams.n_k_sink_prefix*ggml_row_size(layer.k->type, n_embd_k_gqa) +
                 ggml_row_size(layer.k->type, n_embd_nope));
 
         ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
