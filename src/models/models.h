@@ -1209,6 +1209,18 @@ struct llama_model_openpangu_v2 : public llama_model_base {
     struct graph_base : public llm_graph_context {
         graph_base(const llm_graph_params & params) : llm_graph_context(params) {}
 
+        // hoisted per-graph mask tensors (built once by the concrete graph ctor):
+        // [n_k_sink_prefix | n_kv] combined masks and the standalone sink block
+        ggml_tensor * kq_mask_sinked     = nullptr;
+        ggml_tensor * kq_mask_sinked_swa = nullptr;
+        ggml_tensor * sink_mask_blk      = nullptr;
+
+        // sink-prefix mask block [n_k_sink_prefix, n_tokens]: real sinks visible, padding masked
+        ggml_tensor * build_sink_mask_blk(ggml_tensor * kq_mask) const;
+
+        // write the (static) param-sink rows into the reserved K-cache prefix
+        void build_sink_write(const llama_layer & layer, ggml_tensor * k_row, int il) const;
+
         // mHC (manifold hyper-connections), gamma pre-folded into phi at conversion
         ggml_tensor * build_hc_pre(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
                 ggml_tensor * hc_base, ggml_tensor ** post, ggml_tensor ** comb, int il) const;

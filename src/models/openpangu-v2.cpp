@@ -13,12 +13,14 @@
 //     The learned RMSNorm gamma is folded into the phi weight at conversion time.
 //   - MLA attention (absorbed), same as DeepSeek-V2, scale 1/sqrt(qk_head_dim).
 //   - MoME: width-k causal depthwise conv + identity residual on q_a, kv-compressed, and attn-out.
-//   - 128 learned param-sink KV entries per layer (always visible) -- TODO(stage B).
+//   - 128 learned param-sink KV entries per layer (always visible, not indexer-scored).
 //   - Sigmoid-gated MoE with expert bias + shared expert, leading dense layers.
+//   - DSA lightning indexer on the non-SWA trunk layers: per-token top-k selection over
+//     the cached tokens, applied as a mask on the full causal attention. The indexer key
+//     rides in the tail of the cached MLA K row (no separate indexer cache).
 //
-// This first version runs every layer as full causal attention (exact for prompts up to
-// the DSA top-k / SWA window), and computes the MoME conv per batch with zero left-padding
-// (exact within a single prefill). Cross-batch conv state and DSA/SWA masking are follow-ups.
+// The MoME conv state is carried across ubatches via the recurrent memory; SWA layers use
+// the iSWA split cache.
 
 static ggml_tensor * opv2_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t ne0, int64_t i0) {
     return ggml_view_1d(ctx, t, ne0, i0 * ggml_element_size(t));
@@ -44,6 +46,11 @@ void llama_model_openpangu_v2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl, false);
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl, false);
 
+    // DSA lightning indexer (top-k token selection on the non-SWA trunk layers)
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k, false);
+
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
@@ -59,10 +66,9 @@ void llama_model_openpangu_v2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_SINK_COUNT,       hparams.openpangu_n_sink);
     ml.get_key(LLM_KV_ATTENTION_CONV_KERNEL_SIZE, hparams.openpangu_conv_k);
 
-    // DSA lightning indexer (loaded but unused in this dense-attention version)
-    ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);
-    ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
-    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k, false);
+    // the param sinks live in reserved rows at the head of the K cache; pad the
+    // prefix to the flash-attention stride so the total KV length stays aligned
+    hparams.n_k_sink_prefix = GGML_PAD(hparams.openpangu_n_sink, 256);
 
     // per-layer sliding window: SWA layers use a local window, DSA layers are global.
     // Both read from the same compressed MLA KV cache; the iSWA split keeps the
@@ -87,7 +93,9 @@ void llama_model_openpangu_v2::load_arch_hparams(llama_model_loader & ml) {
     // MLA stores a single compressed KV head: size the KV cache to the
     // compressed dims (kv_lora + rope for K, kv_lora for V). The real
     // per-head attention dims come from n_embd_head_{k,v}_mla().
-    hparams.n_embd_head_k_full = hparams.n_lora_kv + hparams.n_rot();
+    // DSA layers append their indexer key to the same cache row; layers
+    // without an indexer (SWA, MTP) zero-pad the tail.
+    hparams.n_embd_head_k_full = hparams.n_lora_kv + hparams.n_rot() + hparams.indexer_head_size;
     hparams.n_embd_head_v_full = hparams.n_lora_kv;
     // SWA layers share the same compressed MLA KV geometry (used to size the iSWA SWA sub-cache)
     hparams.n_embd_head_k_swa = hparams.n_embd_head_k_full;
@@ -117,10 +125,11 @@ void llama_model_openpangu_v2::load_arch_tensors(llama_model_loader &) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    // model-level mHC stream merge (pre_only)
-    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc * n_embd, hc}, 0);
-    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc}, 0);
-    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+    // model-level mHC stream merge (pre_only); absent in split MTP-only GGUFs
+    const int mhc_flags = n_layer > 0 ? 0 : TENSOR_NOT_REQUIRED;
+    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc * n_embd, hc}, mhc_flags);
+    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc}, mhc_flags);
+    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, mhc_flags);
 
     const int64_t hc_mix_dim = (2 + hc) * hc;
 
@@ -172,7 +181,7 @@ void llama_model_openpangu_v2::load_arch_tensors(llama_model_loader &) {
         layer.attn_sink_kv   = create_tensor(tn(LLM_TENSOR_ATTN_SINK_KV,   "weight", i), {kv_lora_rank, n_sink}, 0);
         layer.attn_sink_k_pe = create_tensor(tn(LLM_TENSOR_ATTN_SINK_K_PE, "weight", i), {n_embd_head_qk_rope, n_sink}, 0);
 
-        // DSA lightning indexer (present only on DSA layers; loaded, not used here)
+        // DSA lightning indexer (present only on the non-SWA trunk layers)
         const int64_t idx_h = hparams.indexer_n_head;
         const int64_t idx_d = hparams.indexer_head_size;
         layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, idx_h * idx_d}, TENSOR_NOT_REQUIRED);
@@ -195,6 +204,44 @@ void llama_model_openpangu_v2::load_arch_tensors(llama_model_loader &) {
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
         }
     }
+}
+
+ggml_tensor * llama_model_openpangu_v2::graph_base::build_sink_mask_blk(ggml_tensor * kq_mask) const {
+    const int64_t n_sink = hparams.openpangu_n_sink;
+    const int64_t n_pfx  = hparams.n_k_sink_prefix;
+
+    ggml_tensor * m_vis = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sink,
+            kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
+    m_vis = ggml_fill(ctx0, m_vis, 0.0f);                              // real sinks: always visible
+    ggml_tensor * blk = m_vis;
+    if (n_pfx > n_sink) {
+        ggml_tensor * m_pad = ggml_new_tensor_4d(ctx0, kq_mask->type, n_pfx - n_sink,
+                kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
+        m_pad = ggml_fill(ctx0, m_pad, -INFINITY);                     // padding rows: masked out
+        blk = ggml_concat(ctx0, m_vis, m_pad, 0);
+    }
+    return blk;
+}
+
+void llama_model_openpangu_v2::graph_base::build_sink_write(const llama_layer & layer, ggml_tensor * k_row, int il) const {
+    const int64_t n_sink = hparams.openpangu_n_sink;
+    const int64_t n_pfx  = hparams.n_k_sink_prefix;
+    const int64_t idx_d  = hparams.indexer_head_size;
+
+    // sink rows [row_width, n_pfx]: RMS-norm'd compressed KV + k_pe (not RoPE'd),
+    // zero indexer tail and zero (masked) padding rows. The values are static;
+    // rewriting the small prefix every graph avoids a load-time hook.
+    ggml_tensor * sink_in = ggml_cast(ctx0, layer.attn_sink_kv, GGML_TYPE_F32);
+    ggml_tensor * sink_kv = build_norm(sink_in, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * sink_pe = ggml_cast(ctx0, layer.attn_sink_k_pe, sink_kv->type);
+    ggml_tensor * sink_k  = ggml_concat(ctx0, sink_kv, sink_pe, 0);
+    if (idx_d > 0 || n_pfx > n_sink) {
+        sink_k = ggml_pad(ctx0, sink_k, idx_d, n_pfx - n_sink, 0, 0);
+    }
+    sink_k = ggml_cast(ctx0, sink_k, k_row->type);
+
+    ggml_tensor * dst = ggml_view_2d(ctx0, k_row, k_row->ne[0], n_pfx, k_row->nb[2], 0);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, sink_k, dst));
 }
 
 ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_weighted_sum(ggml_tensor * x, ggml_tensor * weights) const {
@@ -328,15 +375,15 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_mome_conv(ggml_tensor 
     const int64_t d_conv = k - 1;                         // state width per channel
     const int64_t esz    = ggml_element_size(conv_state);
 
-    ggml_tensor * w = ggml_cast(ctx0, conv_w, GGML_TYPE_F32);
+    ggml_tensor * w = conv_w->type == GGML_TYPE_F32 ? conv_w : ggml_cast(ctx0, conv_w, GGML_TYPE_F32);
 
-    // previous-token state for this conv: slice of the gathered recurrent state
-    ggml_tensor * state = ggml_view_2d(ctx0, conv_rs, d_conv * dim, n_seqs, conv_rs->nb[1], state_off * esz);
-    state = ggml_reshape_3d(ctx0, ggml_cont(ctx0, state), d_conv, dim, n_seqs);   // [k-1, dim, n_seqs]
+    // previous-token state for this conv: strided view of the gathered recurrent state
+    ggml_tensor * state = ggml_view_3d(ctx0, conv_rs, d_conv, dim, n_seqs,
+            d_conv * esz, conv_rs->nb[1], state_off * esz);                       // [k-1, dim, n_seqs]
 
-    // input as [n_seq_tokens, dim, n_seqs]
+    // input as [n_seq_tokens, dim, n_seqs]; concat handles the non-contiguous permute
     ggml_tensor * xt = ggml_reshape_3d(ctx0, x, dim, n_seq_tokens, n_seqs);
-    xt = ggml_cont(ctx0, ggml_permute(ctx0, xt, 1, 0, 2, 3));                     // [n_seq_tokens, dim, n_seqs]
+    xt = ggml_permute(ctx0, xt, 1, 0, 2, 3);                                      // [n_seq_tokens, dim, n_seqs]
 
     ggml_tensor * sx = ggml_concat(ctx0, state, xt, 0);                           // [k-1+n_seq_tokens, dim, n_seqs]
 
@@ -382,8 +429,8 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention(const llama_
     // q down -> conv -> norm -> up
     ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_a, cur);
     q = build_mome_conv(q, layer.attn_q_a_conv, conv_rs, conv_state, rs_head, off_qa, n_seqs, n_seq_tokens);
-    q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-    q = ggml_mul_mat(ctx0, layer.wq_b, q);
+    ggml_tensor * q_lora = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    q = ggml_mul_mat(ctx0, layer.wq_b, q_lora);
 
     ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, nt,
             ggml_row_size(q->type, n_embd_head_k), ggml_row_size(q->type, n_embd_head_k) * n_head, 0);
@@ -419,6 +466,44 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention(const llama_
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, nt);
     ggml_tensor * Kcur = ggml_concat(ctx0, kv_cmpr, k_pe, 0);            // [kv_lora+rope, 1, nt]
 
+    // DSA lightning indexer: the per-token indexer key rides in the tail of the
+    // cached K row; layers without an indexer (SWA) zero-pad the tail instead
+    const int64_t idx_d  = hparams.indexer_head_size;
+    const int64_t idx_h  = hparams.indexer_n_head;
+    const bool    is_dsa = idx_d > 0 && hparams.indexer_top_k > 0 && !is_swa &&
+                           layer.indexer_attn_q_b && layer.indexer_attn_k && layer.indexer_proj;
+
+    ggml_tensor * indexer_q = nullptr;
+    if (is_dsa) {
+        // query heads from the post-conv, post-norm q_lora (the wq_b input);
+        // rope on the leading n_rot dims of each head, as in the main attention
+        indexer_q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, q_lora);   // [idx_h*idx_d, nt]
+        ggml_tensor * iq_pe = ggml_view_3d(ctx0, indexer_q, n_embd_head_qk_rope, idx_h, nt,
+                ggml_row_size(indexer_q->type, idx_d), ggml_row_size(indexer_q->type, idx_d) * idx_h, 0);
+        ggml_tensor * iq_nope = ggml_view_3d(ctx0, indexer_q, idx_d - n_embd_head_qk_rope, idx_h, nt,
+                ggml_row_size(indexer_q->type, idx_d), ggml_row_size(indexer_q->type, idx_d) * idx_h,
+                ggml_row_size(indexer_q->type, n_embd_head_qk_rope));
+        iq_pe = ggml_rope_ext(ctx0, iq_pe, inp_pos, nullptr, n_embd_head_qk_rope, GGML_ROPE_TYPE_NEOX,
+                n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        indexer_q = ggml_concat(ctx0, iq_pe, iq_nope, 0);                 // [idx_d, idx_h, nt]
+
+        // single shared key from the attention input: RMS norm, same rope split
+        ggml_tensor * ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur); // [idx_d, nt]
+        ik = build_norm(ik, layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
+        ggml_tensor * ik_pe = ggml_view_3d(ctx0, ik, n_embd_head_qk_rope, 1, nt,
+                ggml_row_size(ik->type, idx_d), ggml_row_size(ik->type, idx_d), 0);
+        ggml_tensor * ik_nope = ggml_view_3d(ctx0, ik, idx_d - n_embd_head_qk_rope, 1, nt,
+                ggml_row_size(ik->type, idx_d), ggml_row_size(ik->type, idx_d),
+                ggml_row_size(ik->type, n_embd_head_qk_rope));
+        ik_pe = ggml_rope_ext(ctx0, ik_pe, inp_pos, nullptr, n_embd_head_qk_rope, GGML_ROPE_TYPE_NEOX,
+                n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        ik = ggml_concat(ctx0, ik_pe, ik_nope, 0);                        // [idx_d, 1, nt]
+
+        Kcur = ggml_concat(ctx0, Kcur, ik, 0);                            // [kv_lora+rope+idx_d, 1, nt]
+    } else if (idx_d > 0) {
+        Kcur = ggml_pad(ctx0, Kcur, idx_d, 0, 0, 0);
+    }
+
     // store compressed K to the right iSWA sub-cache (full for DSA/global layers,
     // windowed for SWA layers). MLA: V is a view of K, decompressed by wv_b.
     ggml_build_forward_expand(gf, Qcur);
@@ -427,44 +512,82 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention(const llama_
     ggml_tensor * k_idxs = is_swa ? inp_attn->get_k_idxs_swa() : inp_attn->get_k_idxs();
     ggml_build_forward_expand(gf, attn_mctx->cpy_k(ctx0, Kcur, k_idxs, il));
 
-    ggml_tensor * k = attn_mctx->get_k(ctx0, il);                       // [kv_lora+rope, 1, n_kv]
+    const int64_t n_pfx = hparams.n_k_sink_prefix;
 
-    // learned param sinks: 128 always-visible compressed KV entries (k_pe not RoPE'd).
-    // The cache pads n_kv to 256; pad the sink block to 256 too so the concatenated KV
-    // length stays a multiple of the flash-attention stride (keeps flash enabled).
-    const int64_t n_sink     = hparams.openpangu_n_sink;
-    const int64_t n_sink_pad = GGML_PAD(n_sink, 256);
-    ggml_tensor * sink_in = ggml_cast(ctx0, layer.attn_sink_kv, GGML_TYPE_F32);
-    ggml_tensor * sink_kv = build_norm(sink_in, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
-    ggml_tensor * sink_pe = ggml_cast(ctx0, layer.attn_sink_k_pe, sink_kv->type);
-    ggml_tensor * sink_k  = ggml_concat(ctx0, sink_kv, sink_pe, 0);     // [kv_lora+rope, n_sink]
-    sink_k = ggml_reshape_4d(ctx0, sink_k, kv_lora_rank + n_embd_head_qk_rope, 1, n_sink, 1);
-    if (n_sink_pad > n_sink) {
-        sink_k = ggml_pad(ctx0, sink_k, 0, 0, n_sink_pad - n_sink, 0);  // dummy rows (masked below)
+    ggml_tensor * k_row = attn_mctx->get_k(ctx0, il);                    // [kv_lora+rope(+idx_d), 1, n_pfx+n_kv]
+
+    // cache-resident param sinks: refresh the reserved prefix rows (cheap, static values)
+    build_sink_write(layer, k_row, il);
+
+    ggml_tensor * k = idx_d == 0 ? k_row
+        : ggml_view_4d(ctx0, k_row, kv_lora_rank + n_embd_head_qk_rope, k_row->ne[1], k_row->ne[2], k_row->ne[3],
+                k_row->nb[1], k_row->nb[2], k_row->nb[3], 0);             // MLA part: [kv_lora+rope, 1, n_pfx+n_kv]
+
+    ggml_tensor * v = ggml_view_4d(ctx0, k_row, kv_lora_rank, k_row->ne[1], k_row->ne[2], k_row->ne[3],
+            k_row->nb[1], k_row->nb[2], k_row->nb[3], 0);
+
+    // hoisted combined mask [n_pfx | n_kv]; DSA layers refine the cell part below
+    ggml_tensor * kq_mask_all = is_swa ? kq_mask_sinked_swa : kq_mask_sinked;
+    ggml_tensor * kq_mask     = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+
+    // while the whole cache fits in the top-k budget the selection is a no-op:
+    // skip the scoring (the indexer keys are still written to the cache above)
+    if (is_dsa && k_row->ne[2] - n_pfx > (int64_t) hparams.indexer_top_k) {
+        // score the cached indexer keys (cell rows only; the param sinks are not
+        // scored -- they stay always-visible through the mask prefix):
+        //   score[t,s] = sum_h w[t,h] * relu(q[t,h,:] . k[s,:])   (no scaling, per the reference)
+        ggml_tensor * ik_cache = ggml_view_4d(ctx0, k_row, idx_d, k_row->ne[1], k_row->ne[2] - n_pfx, k_row->ne[3],
+                k_row->nb[1], k_row->nb[2], k_row->nb[3],
+                n_pfx*k_row->nb[2] + ggml_row_size(k_row->type, kv_lora_rank + n_embd_head_qk_rope)); // [idx_d, 1, n_kv]
+
+        ggml_tensor * iw = ggml_mul_mat(ctx0, layer.indexer_proj, cur);          // [idx_h, nt]
+
+        // split the batch into streams if needed
+        const int64_t n_stream = ik_cache->ne[3];
+        indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream,
+                indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
+        iw = ggml_view_4d(ctx0, iw, iw->ne[0], iw->ne[1]/n_stream, iw->ne[2], n_stream,
+                iw->nb[1], iw->nb[2]/n_stream, iw->nb[3]/n_stream, 0);
+
+        indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);                   // [idx_d, nt, idx_h]
+        ik_cache  = ggml_permute(ctx0, ik_cache,  0, 2, 1, 3);                   // [idx_d, n_kv, 1]
+
+        ggml_tensor * ikq = ggml_mul_mat(ctx0, ik_cache, indexer_q);             // [n_kv, nt, idx_h]
+        ikq = ggml_relu(ctx0, ikq);                                              // contiguous, no cont needed
+        ikq = ggml_cont(ctx0, ggml_permute(ctx0, ikq, 1, 2, 0, 3));              // [idx_h, n_kv, nt]
+
+        // weighted sum over the heads as a batched matvec
+        ggml_tensor * iwv = ggml_view_4d(ctx0, iw, iw->ne[0], 1, iw->ne[1], iw->ne[3],
+                iw->nb[2], iw->nb[1], iw->nb[3], 0);                             // [idx_h, 1, nt]
+        ggml_tensor * iscore = ggml_mul_mat(ctx0, ikq, iwv);                     // [n_kv, 1, nt]
+        iscore = ggml_reshape_4d(ctx0, iscore, iscore->ne[0], iscore->ne[2], 1, iscore->ne[3]); // [n_kv, nt, 1]
+
+        // mask before top-k so invalid/future cells cannot claim slots
+        iscore = ggml_add(ctx0, iscore,
+                kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32));
+
+        const int64_t n_top_k = std::min<int64_t>(iscore->ne[0], hparams.indexer_top_k);
+        ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, iscore, n_top_k));
+
+        // unmask the selected cells on an all-masked copy, then AND with the causal mask
+        // (same construction as the DSA build_attn overload in llama-graph.cpp)
+        ggml_tensor * mask_inf = ggml_fill(ctx0, kq_mask, -INFINITY);
+        mask_inf = ggml_view_4d(ctx0, mask_inf, 1, mask_inf->ne[0], mask_inf->ne[1], mask_inf->ne[3],
+                mask_inf->nb[0], mask_inf->nb[1], mask_inf->nb[2], 0);
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
+                top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+        ggml_tensor * unmasked = ggml_set_rows(ctx0, mask_inf, zeros, top_k_3d);
+        unmasked = ggml_view_4d(ctx0, unmasked, unmasked->ne[1], unmasked->ne[2], 1, unmasked->ne[3],
+                unmasked->nb[2], unmasked->nb[3], unmasked->nb[3], 0);
+        kq_mask = ggml_add(ctx0, unmasked, kq_mask);
+
+        // per-DSA-layer combined mask (the top-k selection differs per layer)
+        kq_mask_all = ggml_concat(ctx0, sink_mask_blk, kq_mask, 0);
     }
-    sink_k = ggml_cast(ctx0, sink_k, k->type);
-    if (k->ne[3] != 1) {
-        sink_k = ggml_repeat_4d(ctx0, sink_k, sink_k->ne[0], sink_k->ne[1], sink_k->ne[2], k->ne[3]);
-    }
-    k = ggml_concat(ctx0, sink_k, k, 2);                               // sinks first
 
-    ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3],
-            k->nb[1], k->nb[2], k->nb[3], 0);
-
-    ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
-    ggml_tensor * m_vis = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sink,
-            kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
-    m_vis = ggml_fill(ctx0, m_vis, 0.0f);                              // real sinks: always visible
-    ggml_tensor * sink_mask = m_vis;
-    if (n_sink_pad > n_sink) {
-        ggml_tensor * m_pad = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sink_pad - n_sink,
-                kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
-        m_pad = ggml_fill(ctx0, m_pad, -INFINITY);                     // dummy sinks: masked out
-        sink_mask = ggml_concat(ctx0, m_vis, m_pad, 0);
-    }
-    kq_mask = ggml_concat(ctx0, sink_mask, kq_mask, 0);
-
-    ggml_tensor * attn_out = build_attn_mha(Qcur, k, v, nullptr, kq_mask, nullptr, layer.wv_b, kq_scale, il);
+    ggml_tensor * attn_out = build_attn_mha(Qcur, k, v, nullptr, kq_mask_all, nullptr, layer.wv_b, kq_scale, il);
 
     attn_out = build_mome_conv(attn_out, layer.attn_o_conv, conv_rs, conv_state, rs_head, off_o, n_seqs, n_seq_tokens);
     attn_out = ggml_mul_mat(ctx0, layer.wo, attn_out);                  // o_proj
@@ -474,9 +597,10 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention(const llama_
 ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention_mtp(const llama_model & model, llm_graph_input_attn_kv_iswa * inp_attn,
         ggml_tensor * cur, ggml_tensor * inp_pos, float kq_scale, int il) const {
     const auto & layer = model.layers[il];
-    // MTP layers are converted as full attention (the reference uses SWA 2048 here,
-    // which the single global n_swa cannot express next to the trunk's 512; the
-    // divergence only affects draft acceptance rate) -- see conversion/pangu.py
+    // in the combined GGUF the MTP layers are converted as full attention (the single
+    // global n_swa cannot express the reference's 2048 next to the trunk's 512); a
+    // split MTP-only GGUF carries its own n_swa = 2048 and runs SWA here, matching
+    // the reference -- see conversion/pangu.py and conversion/split_pangu_mtp.py
     const bool is_swa = hparams.is_swa(il);
 
     const int64_t n_embd_head_k       = hparams.n_embd_head_k_mla();
@@ -520,48 +644,34 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention_mtp(const ll
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, nt);
     ggml_tensor * Kcur = ggml_concat(ctx0, kv_cmpr, k_pe, 0);
 
+    // MTP layers have no indexer -- zero-pad the DSA tail of the cache row
+    const int64_t idx_d = hparams.indexer_head_size;
+    if (idx_d > 0) {
+        Kcur = ggml_pad(ctx0, Kcur, idx_d, 0, 0, 0);
+    }
+
     ggml_build_forward_expand(gf, Qcur);
     ggml_build_forward_expand(gf, Kcur);
     const auto * attn_mctx = is_swa ? inp_attn->mctx->get_swa() : inp_attn->mctx->get_base();
     ggml_tensor * k_idxs = is_swa ? inp_attn->get_k_idxs_swa() : inp_attn->get_k_idxs();
     ggml_build_forward_expand(gf, attn_mctx->cpy_k(ctx0, Kcur, k_idxs, il));
 
-    ggml_tensor * k = attn_mctx->get_k(ctx0, il);
+    ggml_tensor * k_row = attn_mctx->get_k(ctx0, il);                   // [row_w, 1, n_pfx+n_kv]
 
-    // learned param sinks (padded to the flash stride, as in the trunk)
-    const int64_t n_sink     = hparams.openpangu_n_sink;
-    const int64_t n_sink_pad = GGML_PAD(n_sink, 256);
-    ggml_tensor * sink_in = ggml_cast(ctx0, layer.attn_sink_kv, GGML_TYPE_F32);
-    ggml_tensor * sink_kv = build_norm(sink_in, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
-    ggml_tensor * sink_pe = ggml_cast(ctx0, layer.attn_sink_k_pe, sink_kv->type);
-    ggml_tensor * sink_k  = ggml_concat(ctx0, sink_kv, sink_pe, 0);
-    sink_k = ggml_reshape_4d(ctx0, sink_k, kv_lora_rank + n_embd_head_qk_rope, 1, n_sink, 1);
-    if (n_sink_pad > n_sink) {
-        sink_k = ggml_pad(ctx0, sink_k, 0, 0, n_sink_pad - n_sink, 0);
-    }
-    sink_k = ggml_cast(ctx0, sink_k, k->type);
-    if (k->ne[3] != 1) {
-        sink_k = ggml_repeat_4d(ctx0, sink_k, sink_k->ne[0], sink_k->ne[1], sink_k->ne[2], k->ne[3]);
-    }
-    k = ggml_concat(ctx0, sink_k, k, 2);
+    // cache-resident param sinks: refresh the reserved prefix rows
+    build_sink_write(layer, k_row, il);
 
-    ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3],
-            k->nb[1], k->nb[2], k->nb[3], 0);
+    ggml_tensor * k = idx_d == 0 ? k_row
+        : ggml_view_4d(ctx0, k_row, kv_lora_rank + n_embd_head_qk_rope, k_row->ne[1], k_row->ne[2], k_row->ne[3],
+                k_row->nb[1], k_row->nb[2], k_row->nb[3], 0);
 
-    ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
-    ggml_tensor * m_vis = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sink,
-            kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
-    m_vis = ggml_fill(ctx0, m_vis, 0.0f);
-    ggml_tensor * sink_mask = m_vis;
-    if (n_sink_pad > n_sink) {
-        ggml_tensor * m_pad = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sink_pad - n_sink,
-                kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
-        m_pad = ggml_fill(ctx0, m_pad, -INFINITY);
-        sink_mask = ggml_concat(ctx0, m_vis, m_pad, 0);
-    }
-    kq_mask = ggml_concat(ctx0, sink_mask, kq_mask, 0);
+    ggml_tensor * v = ggml_view_4d(ctx0, k_row, kv_lora_rank, k_row->ne[1], k_row->ne[2], k_row->ne[3],
+            k_row->nb[1], k_row->nb[2], k_row->nb[3], 0);
 
-    ggml_tensor * attn_out = build_attn_mha(Qcur, k, v, nullptr, kq_mask, nullptr, layer.wv_b, kq_scale, il);
+    // hoisted combined mask
+    ggml_tensor * kq_mask_all = is_swa ? kq_mask_sinked_swa : kq_mask_sinked;
+
+    ggml_tensor * attn_out = build_attn_mha(Qcur, k, v, nullptr, kq_mask_all, nullptr, layer.wv_b, kq_scale, il);
     attn_out = ggml_mul_mat(ctx0, layer.wo, attn_out);   // o_proj (no MoME conv)
     return attn_out;
 }
@@ -602,6 +712,8 @@ std::unique_ptr<llm_graph_context> llama_model_openpangu_v2::build_arch_graph(co
 
 llama_model_openpangu_v2::graph::graph(const llama_model & model, const llm_graph_params & params) :
     graph_base(params) {
+    GGML_ASSERT(n_layer > 0 && "openpangu-v2: no trunk layers -- a split MTP-only GGUF can only be used as --model-draft with --mtp");
+
     const int64_t hc = hparams.dsv4_hc_mult;
     const float kq_scale = 1.0f / sqrtf(float(hparams.n_embd_head_k_mla()));
 
@@ -611,6 +723,15 @@ llama_model_openpangu_v2::graph::graph(const llama_model & model, const llm_grap
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     auto * inp_hybrid = build_inp_mem_hybrid_iswa();
+
+    // hoisted sink masks: one [n_pfx | n_kv] concat per variant per graph
+    {
+        ggml_tensor * mask_base = inp_hybrid->get_attn()->get_kq_mask();
+        ggml_tensor * mask_swa  = inp_hybrid->get_attn()->get_kq_mask_swa();
+        sink_mask_blk      = build_sink_mask_blk(mask_base);
+        kq_mask_sinked     = ggml_concat(ctx0, sink_mask_blk, mask_base, 0);
+        kq_mask_sinked_swa = ggml_concat(ctx0, build_sink_mask_blk(mask_swa), mask_swa, 0);
+    }
 
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
@@ -628,6 +749,15 @@ llama_model_openpangu_v2::graph::graph(const llama_model & model, const llm_grap
         cur = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         inpL = build_hc_post(cur, residual, post, comb, il);
 
+        // the last layer's FFN only needs the requested output rows -- gather early,
+        // unless the unmasked MTP extraction needs the full-length hidden state
+        if (il == n_layer - 1 && inp_out_ids &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+            ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd * hc, n_tokens);
+            flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+            inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
+        }
+
         // feed-forward block
         residual = inpL;
         cur = build_hc_pre(inpL, model.layers[il].hc_ffn_fn, model.layers[il].hc_ffn_scale,
@@ -641,31 +771,25 @@ llama_model_openpangu_v2::graph::graph(const llama_model & model, const llm_grap
 
         // block post norm on the stream-concatenated residual (subset of layers)
         if (model.layers[il].block_post_norm) {
-            ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd * hc, n_tokens);
+            const int64_t nt_l = inpL->ne[2];
+            ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd * hc, nt_l);
             flat = build_norm(flat, model.layers[il].block_post_norm, nullptr, LLM_NORM_RMS, il);
-            inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_tokens);
+            inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, nt_l);
         }
 
         inpL = build_cvec(inpL, il);
     }
 
-    // Collapse the mHC streams on the full (ungathered) hidden so the MTP head can read
-    // every position's hidden state (t_h_nextn). For the masked-extraction case, gather
-    // to the requested output rows first. The expensive output projection always runs on
-    // the gathered rows only.
-    if (cparams.embeddings_nextn_masked && inp_out_ids) {
-        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd * hc, n_tokens);
-        flat = ggml_get_rows(ctx0, flat, inp_out_ids);
-        inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
-    }
-
+    // Collapse the mHC streams. In the unmasked-MTP case inpL still holds all
+    // n_tokens rows so t_h_nextn covers every position; otherwise the last-layer
+    // gather above already reduced it to the output rows.
     cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
 
     // trunk hidden state (pre-output-norm), consumed by the MTP head for speculative drafting
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
@@ -705,6 +829,16 @@ llama_model_openpangu_v2::graph_mtp::graph_mtp(const llama_model & model, const 
 
     ggml_tensor * inp_pos = build_inp_pos();
     auto * inp_attn = build_attn_inp_kv_iswa();
+
+    // hoisted sink masks (the swa variant is live for split MTP-only models, where
+    // the MTP layers run their reference SWA-2048 window)
+    {
+        ggml_tensor * mask_base = inp_attn->get_kq_mask();
+        ggml_tensor * mask_swa  = inp_attn->get_kq_mask_swa();
+        sink_mask_blk      = build_sink_mask_blk(mask_base);
+        kq_mask_sinked     = ggml_concat(ctx0, sink_mask_blk, mask_base, 0);
+        kq_mask_sinked_swa = ggml_concat(ctx0, build_sink_mask_blk(mask_swa), mask_swa, 0);
+    }
 
     // eh_proj( concat[ enorm(embed(next_tok)), hnorm(prev_hidden) ] )
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
