@@ -1,5 +1,6 @@
 #include "concat.cuh"
 
+#include <algorithm>
 #include <stdint.h>
 
 // contiguous kernels
@@ -103,39 +104,45 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
           uint64_t   nb12,
           uint64_t   nb13,
            int64_t   ne0,
-           int64_t /*ne1*/,
-           int64_t /*ne2*/,
-           int64_t /*ne3*/,
+           int64_t   ne1,
+           int64_t   ne2,
+           int64_t   ne3,
           uint64_t   nb0,
           uint64_t   nb1,
           uint64_t   nb2,
           uint64_t   nb3) {
     static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
 
-    const int64_t i3 = blockIdx.z;
-    const int64_t i2 = blockIdx.y;
-    const int64_t i1 = blockIdx.x;
+    // rows are flattened into a grid-stride loop over gridDim.x because
+    // ne1/ne2/ne3 can each exceed the CUDA grid.y/grid.z limit of 65535
+    const int64_t n_rows = ne1*ne2*ne3;
 
     const T * x;
 
-    for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
-        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-            x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
-        } else {
-            if constexpr (dim == 0) {
-                x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
-            } else if constexpr (dim == 1) {
-                x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
-            } else if constexpr (dim == 2) {
-                x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
-            } else if constexpr (dim == 3) {
-                x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+    for (int64_t ir = blockIdx.x; ir < n_rows; ir += gridDim.x) {
+        const int64_t i3 = ir / (ne1*ne2);
+        const int64_t i2 = (ir - i3*ne1*ne2) / ne1;
+        const int64_t i1 =  ir - i3*ne1*ne2 - i2*ne1;
+
+        for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
+            if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+            } else {
+                if constexpr (dim == 0) {
+                    x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+                } else if constexpr (dim == 1) {
+                    x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+                } else if constexpr (dim == 2) {
+                    x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+                } else if constexpr (dim == 3) {
+                    x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+                }
             }
+
+            T * y = (T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+
+            *y = *x;
         }
-
-        T * y = (T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-
-        *y = *x;
     }
 }
 
@@ -163,7 +170,8 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
             CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
         }
     } else {
-        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+        const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+        dim3 grid_dim((unsigned) std::min<int64_t>(n_rows, INT32_MAX));
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
