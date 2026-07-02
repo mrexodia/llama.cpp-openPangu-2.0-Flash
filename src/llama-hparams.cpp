@@ -191,6 +191,12 @@ uint32_t llama_hparams::n_embd_r() const {
         return n_embd * (n_shortconv_l_cache - 1);
     }
 
+    if (openpangu_conv_k != 0) {
+        // openPangu MoME: three causal convs (q_a, kv-compressed, attn-out) per layer
+        const uint32_t o_dim = n_head() * n_embd_head_v_mla();
+        return (openpangu_conv_k - 1) * (n_lora_q + n_lora_kv + o_dim);
+    }
+
     if (n_embd_head_kda != 0) {
         // for Kimi KDA layers
         // Conv state for Q, K, V: 3 * (d_conv - 1) * n_head * head_dim

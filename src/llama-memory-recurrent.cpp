@@ -26,7 +26,10 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
-    const int32_t n_layer = hparams.n_layer();
+    // size to the full layer count (incl. MTP/NextN layers) so a filtered MTP
+    // context can allocate recurrent state for layers >= n_layer(); get_r_l/get_s_l
+    // index by the original layer id, and the filter leaves unused layers null.
+    const int32_t n_layer = hparams.n_layer_all;
 
     head = 0;
     size = mem_size;

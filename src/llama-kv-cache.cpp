@@ -344,6 +344,12 @@ llama_kv_cache::llama_kv_cache(
             attn_rot_k = true;
         }
 
+        // openPangu-v2's custom MLA+sink attention does not apply the rotation,
+        // so do not create rotation inputs its graph would leave unused
+        if (model.arch == LLM_ARCH_OPENPANGU_V2) {
+            attn_rot_k = false;
+        }
+
         attn_rot_v =
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
@@ -1410,6 +1416,11 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
 }
 
 ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (hparams.is_mla()) {
+        // K-only MLA cache: there are no V tensors, so no graph consumes v_idxs
+        return nullptr;
+    }
+
     const uint32_t n_tokens = ubatch.n_tokens;
 
     ggml_tensor * v_idxs;

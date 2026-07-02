@@ -2053,11 +2053,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
-                // The MTP head is dense-attention only on hybrid Qwen3.5/3.6, so use a plain
-                // attention KV cache for the MTP context instead of the hybrid wrapper.
+                // The MTP head is dense-attention only on hybrid Qwen3.5/3.6 and openPangu-v2
+                // (its MTP layers skip the recurrent MoME conv), so use a plain attention KV
+                // cache for the MTP context instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen35 =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_OPENPANGU_V2);
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
@@ -2074,7 +2075,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-                    if (arch == LLM_ARCH_FALCON_H1) {
+                    if (arch == LLM_ARCH_OPENPANGU_V2 && hparams.n_layer_nextn > 0) {
+                        // every layer has both attention (MLA) and a recurrent conv state;
+                        // split the trunk (default context) from the MTP heads (MTP context)
+                        const bool is_mtp = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                        auto filt = [is_mtp, this](uint32_t il) {
+                            return is_mtp ? (il >= hparams.n_layer()) : (il < hparams.n_layer());
+                        };
+                        filter_attn = filt;
+                        filter_recr = filt;
+                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_OPENPANGU_V2) {
+                        // every layer has both attention (MLA) and a recurrent conv state
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {

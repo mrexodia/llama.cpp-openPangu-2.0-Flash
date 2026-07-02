@@ -1205,8 +1205,9 @@ struct llama_model_openpangu_v2 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    struct graph : public llm_graph_context {
-        graph(const llama_model & model, const llm_graph_params & params);
+    // shared helpers used by both the trunk graph and the MTP head graph
+    struct graph_base : public llm_graph_context {
+        graph_base(const llm_graph_params & params) : llm_graph_context(params) {}
 
         // mHC (manifold hyper-connections), gamma pre-folded into phi at conversion
         ggml_tensor * build_hc_pre(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
@@ -1218,11 +1219,30 @@ struct llama_model_openpangu_v2 : public llama_model_base {
         ggml_tensor * build_hc_weighted_sum(ggml_tensor * x, ggml_tensor * weights) const;
         ggml_tensor * build_hc_sinkhorn(ggml_tensor * comb, int il) const;
 
-        // MoME width-k causal depthwise conv + identity residual (zero-pad, per-batch)
-        ggml_tensor * build_mome_conv(ggml_tensor * x, ggml_tensor * conv_w) const;
+        // MoME width-k causal depthwise conv + identity residual, with recurrent decode state
+        ggml_tensor * build_mome_conv(ggml_tensor * x, ggml_tensor * conv_w,
+                ggml_tensor * conv_rs, ggml_tensor * conv_state, int64_t rs_head,
+                int64_t state_off, int64_t n_seqs, int64_t n_seq_tokens) const;
 
-        ggml_tensor * build_attention(const llama_model & model, llm_graph_input_attn_k * inp_attn,
+        ggml_tensor * build_attention(const llama_model & model, llm_graph_input_mem_hybrid_iswa * inp,
                 ggml_tensor * cur, ggml_tensor * inp_pos, float kq_scale, int il) const;
+
+        // MTP-head attention: MLA + param sinks over a plain (non-hybrid) iSWA KV cache,
+        // without the recurrent MoME conv (drafts are verified, so the conv is skipped).
+        ggml_tensor * build_attention_mtp(const llama_model & model, llm_graph_input_attn_kv_iswa * inp_attn,
+                ggml_tensor * cur, ggml_tensor * inp_pos, float kq_scale, int il) const;
+
+        // MoE + shared-expert block (used by both trunk and MTP layers)
+        ggml_tensor * build_moe_block(const llama_model & model, ggml_tensor * cur, int il) const;
+    };
+
+    struct graph : public graph_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // MTP / NextN head graph for self-speculative decoding
+    struct graph_mtp : public graph_base {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

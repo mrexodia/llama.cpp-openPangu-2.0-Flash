@@ -2787,11 +2787,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD}).set_env("HF_TOKEN"));
     add_opt(common_arg(
         {"--mtp"},
-        "also download the multi-token prediction (MTP) head, if available (default: unused)",
+        "enable multi-token prediction (MTP) self-speculative decoding, and download the MTP head if available (default: unused)",
         [](common_params & params) {
             params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
         }
-    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
+    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--context-file"}, "FNAME",
         "file to load context from (use comma-separated values to specify multiple files)",

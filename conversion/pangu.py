@@ -95,6 +95,13 @@ class OpenPanguV2Model(TextModel):
         "mlp.gate_proj.weight":                    (gguf.MODEL_TENSOR.FFN_GATE,        ".weight"),
         "mlp.up_proj.weight":                      (gguf.MODEL_TENSOR.FFN_UP,          ".weight"),
         "mlp.down_proj.weight":                    (gguf.MODEL_TENSOR.FFN_DOWN,        ".weight"),
+        # MTP / NextN heads (layers >= num_hidden_layers)
+        "enorm.weight":                            (gguf.MODEL_TENSOR.NEXTN_ENORM,            ".weight"),
+        "hnorm.weight":                            (gguf.MODEL_TENSOR.NEXTN_HNORM,            ".weight"),
+        "eh_proj.weight":                          (gguf.MODEL_TENSOR.NEXTN_EH_PROJ,          ".weight"),
+        "embed_tokens.weight":                     (gguf.MODEL_TENSOR.NEXTN_EMBED_TOKENS,     ".weight"),
+        "shared_head.norm.weight":                 (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, ".weight"),
+        "shared_head.head.weight":                 (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD, ".weight"),
     }
 
     _expert_map = {
@@ -108,6 +115,11 @@ class OpenPanguV2Model(TextModel):
         # buffers for mHC gamma-fold and expert stacking
         self._mhc_buf: dict = {}
         self._exp_buf: dict = {}
+        # include the MTP / NextN prediction layers in the block count
+        self._n_nextn = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
+        if self._n_nextn > 0:
+            self.block_count = self.hparams["num_hidden_layers"] + self._n_nextn
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
     def set_vocab(self):
         # openPangu ships a custom tokenizer_class in tokenizer_config.json, but
@@ -158,13 +170,21 @@ class OpenPanguV2Model(TextModel):
         self.gguf_writer.add_sink_count(hparams["param_sink_number"])
         self.gguf_writer.add_conv_kernel_size(hparams["router_sliding_window"])
 
-        # per-layer sliding window: DSA layers get 0, SWA layers get their window
+        if self._n_nextn > 0:
+            self.gguf_writer.add_nextn_predict_layers(self._n_nextn)
+
+        # per-layer sliding window: DSA layers get 0, SWA layers get their window.
+        # NOTE: the reference runs the MTP / NextN layers with SWA (window 2048,
+        # sliding_window_list[-1]), but llama.cpp has a single global window size and
+        # the trunk SWA layers use 512, so the MTP layers are converted as global (0).
+        # This diverges from the reference at contexts beyond the MTP window and can
+        # only lower draft acceptance (drafts are verified by the trunk).
         n_layer = hparams["num_hidden_layers"]
         swa_layers = hparams["swa_layers"]
         window_list = hparams["sliding_window_list"]
         layer_window = []
-        for il in range(n_layer):
-            if il in swa_layers:
+        for il in range(self.block_count):
+            if il < n_layer and il in swa_layers:
                 layer_window.append(int(window_list[swa_layers.index(il)]))
             else:
                 layer_window.append(0)
@@ -182,12 +202,6 @@ class OpenPanguV2Model(TextModel):
         return [(self.format_tensor_name(tensor_enum, bid), folded)]
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        n_layer = self.hparams["num_hidden_layers"]
-
-        # skip MTP / NextN prediction layers (conversion v0)
-        if bid is not None and bid >= n_layer:
-            return []
-
         # MLA absorption: split kv_b_proj into k_b (transposed) and v_b
         if bid is not None and name.endswith("self_attn.kv_b_proj.weight"):
             n_head = self.hparams["num_attention_heads"]

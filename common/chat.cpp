@@ -1775,6 +1775,112 @@ static common_chat_params common_chat_params_init_lfm2(const common_chat_templat
     return data;
 }
 
+// openPangu format detection: <|message_start|>{role} turns with
+// <|tool_call_start|>[{"name":..,"arguments":..}]<|tool_call_end|> tool calls and <think> reasoning
+static bool is_openpangu_template(const std::string & src) {
+    return src.find("<|tool_call_start|>") != std::string::npos &&
+           src.find("<|message_start|>")   != std::string::npos;
+}
+
+static common_chat_params common_chat_params_init_openpangu(const common_chat_template &          tmpl,
+                                                            const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    const std::string TOOL_CALL_START = "<|tool_call_start|>";
+    const std::string TOOL_CALL_END   = "<|tool_call_end|>";
+    const std::string THINK_START     = "<think>";
+    const std::string THINK_END       = "</think>";
+    const std::string GEN_PROMPT      = "<|message_start|>assistant\n";
+
+    // the template reads a 'thinking' flag (default true): thinking on force-opens the
+    // think block in the generation prompt ('...assistant\n<think>'), thinking off closes
+    // it immediately ('...assistant\n</think>')
+    const json template_context = { {"thinking", inputs.enable_thinking} };
+
+    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, template_context);
+    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs, std::nullopt, std::nullopt, template_context);
+    data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking  = true;
+    data.thinking_start_tag = THINK_START;
+    data.thinking_end_tag   = THINK_END;
+    data.preserved_tokens   = { TOOL_CALL_START, TOOL_CALL_END, THINK_START, THINK_END };
+
+    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE &&
+                               tmpl.source().find(THINK_START) != std::string::npos;
+    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+
+    if (inputs.has_continuation()) {
+        const auto & msg = inputs.continue_msg;
+
+        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += THINK_END + msg.render_content();
+        }
+
+        data.prompt += data.generation_prompt;
+    }
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        // the parser input is generation_prompt + completion when the caller plumbs the
+        // generation prompt through (server), and just the completion otherwise (cli) --
+        // so the assistant header is optional
+        auto generation_prompt = p.optional(p.literal(GEN_PROMPT));
+        auto end = p.end();
+
+        auto reasoning = p.eps();
+        if (extract_reasoning) {
+            // the template force-opens the think block: '<think>' is only seen when the
+            // generation prompt is prepended, so the opening tag is optional; with thinking
+            // disabled the template emits a bare '</think>', parsed as empty reasoning
+            reasoning = p.optional(p.optional(p.literal(THINK_START)) + p.reasoning(p.until(THINK_END)) + p.literal(THINK_END));
+        }
+
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            if (has_response_format) {
+                auto response_format = p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema));
+                return generation_prompt + reasoning + response_format + end;
+            }
+            return generation_prompt + reasoning + p.content(p.rest()) + end;
+        }
+
+        auto tool_calls = p.standard_json_tools(TOOL_CALL_START, TOOL_CALL_END, inputs.tools, inputs.parallel_tool_calls,
+                                                /* force_tool_calls = */ false,
+                                                /* name_key         = */ "name",
+                                                /* args_key         = */ "arguments",
+                                                /* array_wrapped    = */ true);
+
+        auto content = p.content(p.until(TOOL_CALL_START));
+
+        return generation_prompt + reasoning + content + p.optional(tool_calls) + end;
+    });
+
+    data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                auto         schema   = function.at("parameters");
+                builder.resolve_refs(schema);
+            });
+            if (has_response_format) {
+                auto schema = inputs.json_schema;
+                builder.resolve_refs(schema);
+            }
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        data.grammar_triggers = {
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TOOL_CALL_START }
+        };
+    }
+
+    return data;
+}
+
 static common_chat_params common_chat_params_init_gigachat_v3(
         const common_chat_template & tmpl,
         const autoparser::generation_params & inputs) {
@@ -2573,6 +2679,11 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("<|START_ACTION|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Cohere2 MoE\n");
         return common_chat_params_init_cohere2moe(tmpl, params);
+    }
+
+    if (is_openpangu_template(src)) {
+        LOG_DBG("Using specialized template: openPangu\n");
+        return common_chat_params_init_openpangu(tmpl, params);
     }
 
     if (is_lfm2_template(src)) {
