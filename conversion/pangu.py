@@ -121,6 +121,12 @@ class OpenPanguV2Model(TextModel):
             self.block_count = self.hparams["num_hidden_layers"] + self._n_nextn
             self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # tiny depthwise conv kernels, consumed as F32 by ggml_ssm_conv
+        if new_name.endswith("_conv.weight") and ".attn_" in new_name:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
     def set_vocab(self):
         # openPangu ships a custom tokenizer_class in tokenizer_config.json, but
         # tokenizer.json is a standard ByteLevel BPE. Allow AutoTokenizer to load
@@ -252,11 +258,15 @@ class OpenPanguV2Model(TextModel):
             if suffix in self._layer_map:
                 enum, sfx = self._layer_map[suffix]
                 out = data_torch
-                # depthwise conv weights are [C, 1, k]; drop the singleton group dim
+                # depthwise conv weights are [C, 1, k]; drop the singleton group dim.
+                # store as F32 so ggml_ssm_conv uses them without a per-eval cast
+                # (like Mamba's ssm_conv1d; they are tiny)
                 if enum in (gguf.MODEL_TENSOR.ATTN_Q_A_CONV,
                             gguf.MODEL_TENSOR.ATTN_KV_A_CONV,
-                            gguf.MODEL_TENSOR.ATTN_O_CONV) and out.ndim == 3:
-                    out = out.squeeze(1)
+                            gguf.MODEL_TENSOR.ATTN_O_CONV):
+                    if out.ndim == 3:
+                        out = out.squeeze(1)
+                    out = out.float()
                 return [(self.format_tensor_name(enum, bid, sfx), out)]
 
         logger.warning(f"openpangu-v2: unmapped tensor '{name}'")
