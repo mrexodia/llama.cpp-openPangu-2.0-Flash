@@ -1422,6 +1422,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const int64_t t_beg = ggml_time_us();
+
                 const int32_t rc = llama_decode(ctx_dft, batch);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
@@ -1429,6 +1431,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     ok = false;
                     break;
                 }
+
+                SPC_DBG("catch-up decode head=%d n_tokens=%d took %.1f ms\n",
+                        head, (int) batch.n_tokens, (ggml_time_us() - t_beg) / 1000.0);
             }
 
             if (chain_heads) {
@@ -1511,11 +1516,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t t_beg = ggml_time_us();
+
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
+
+            SPC_DBG("draft decode step=%d n_tokens=%d took %.1f ms\n",
+                    i, (int) batch.n_tokens, (ggml_time_us() - t_beg) / 1000.0);
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
