@@ -18,6 +18,10 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that adds full supp
 - Fused CUDA/CPU kernels for the mHC mixing chain (`GGML_OP_SINKHORN`,
   `GGML_OP_HC_MIX`) — decode is ~40% faster than the naive graph, with automatic
   fallback to the unfused ops on backends without the kernels (e.g. Metal)
+- Gather-based sparse attention at decode: the DSA layers attend only the
+  top-2048 selected tokens (plus sinks) instead of masking the full cache, with a
+  fused indexer-scoring kernel (`GGML_OP_DSA_SCORE`) — generation at 100K context
+  runs ~73% faster and stays within ~30% of short-context speed
 - HF → GGUF conversion (`convert_hf_to_gguf.py`) and a base/MTP split tool
   (`conversion/split_pangu_mtp.py`)
 - Multi-token-prediction self-speculative decoding (`--mtp`, with the split MTP draft GGUF)
@@ -46,8 +50,8 @@ DGX Spark (GB10, unified memory):
 
 | llama-server, Q4_K_M | short | @10K | @24K | @100K |
 |---|---|---|---|---|
-| Prompt processing | n/a¹ | 525 t/s | 359 t/s | 134 t/s |
-| Generation | ~25 t/s | 21.5 t/s | 18.4 t/s | 10.4 t/s |
+| Prompt processing | n/a¹ | 524 t/s | 359 t/s | 134 t/s |
+| Generation | ~25 t/s | 22.4 t/s | 21.4 t/s | 18.0 t/s |
 
 ¹ prompt-processing throughput is not meaningful for very short prompts (dominated by
 fixed per-request overhead) — see `pp512` above.
