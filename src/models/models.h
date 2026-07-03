@@ -1205,9 +1205,19 @@ struct llama_model_openpangu_v2 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // true when every model device supports the fused GGML_OP_SINKHORN; computed
+    // lazily on the first graph build (backends without the op, e.g. Metal, get
+    // the unfused op sequence instead)
+    bool sinkhorn_fused() const;
+    mutable int sinkhorn_fused_probe = -1;
+
     // shared helpers used by both the trunk graph and the MTP head graph
     struct graph_base : public llm_graph_context {
-        graph_base(const llm_graph_params & params) : llm_graph_context(params) {}
+        graph_base(const llm_graph_params & params, bool sinkhorn_fused)
+            : llm_graph_context(params), use_fused_sinkhorn(sinkhorn_fused) {}
+
+        // whether build_hc_sinkhorn emits the fused op or the unfused sequence
+        const bool use_fused_sinkhorn;
 
         // hoisted per-graph mask tensors (built once by the concrete graph ctor):
         // [n_k_sink_prefix | n_kv] combined masks and the standalone sink block
@@ -1221,14 +1231,18 @@ struct llama_model_openpangu_v2 : public llama_model_base {
         // write the (static) param-sink rows into the reserved K-cache prefix
         void build_sink_write(const llama_layer & layer, ggml_tensor * k_row, int il) const;
 
-        // mHC (manifold hyper-connections), gamma pre-folded into phi at conversion
-        ggml_tensor * build_hc_pre(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
+        // mHC (manifold hyper-connections), gamma pre-folded into phi at conversion.
+        // xt/residual_t is the transposed stream state [hc, n_embd, nt], computed once
+        // per block and shared by the pre- and post-merge batched matmuls; when null
+        // (large batches) the per-stream loop form is used instead.
+        ggml_tensor * build_hc_pre(ggml_tensor * x, ggml_tensor * xt,
+                ggml_tensor * hc_fn, ggml_tensor * hc_scale,
                 ggml_tensor * hc_base, ggml_tensor ** post, ggml_tensor ** comb, int il) const;
-        ggml_tensor * build_hc_post(ggml_tensor * x, ggml_tensor * residual, ggml_tensor * post,
-                ggml_tensor * comb, int il) const;
+        ggml_tensor * build_hc_post(ggml_tensor * x, ggml_tensor * residual, ggml_tensor * residual_t,
+                ggml_tensor * post, ggml_tensor * comb, int il) const;
         ggml_tensor * build_hc_head(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
                 ggml_tensor * hc_base) const;
-        ggml_tensor * build_hc_weighted_sum(ggml_tensor * x, ggml_tensor * weights) const;
+        ggml_tensor * build_hc_weighted_sum(ggml_tensor * x, ggml_tensor * xt, ggml_tensor * weights) const;
         ggml_tensor * build_hc_sinkhorn(ggml_tensor * comb, int il) const;
 
         // MoME width-k causal depthwise conv + identity residual, with recurrent decode state

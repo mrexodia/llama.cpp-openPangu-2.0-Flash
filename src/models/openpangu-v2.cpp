@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include "ggml-cpp.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
@@ -244,9 +245,22 @@ void llama_model_openpangu_v2::graph_base::build_sink_write(const llama_layer & 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, sink_k, dst));
 }
 
-ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_weighted_sum(ggml_tensor * x, ggml_tensor * weights) const {
+// The mHC stream reductions have two shapes: a batched-matmul form (few kernel
+// launches -- wins at decode, where launch overhead dominates) and a per-stream
+// loop form (no stream-transpose copies or tiny batched GEMMs -- wins at prefill).
+// The transposed stream state xt selects the form: non-null => batched.
+static const int64_t OPV2_HC_BATCHED_NT_MAX = 8;
+
+ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_weighted_sum(ggml_tensor * x, ggml_tensor * xt, ggml_tensor * weights) const {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[2];
+
+    if (xt) {
+        // out[e,t] = sum_h xt[h,e,t] * w[h,t]: one batched matvec over the streams
+        ggml_tensor * wr  = ggml_reshape_3d(ctx0, weights, hc, 1, nt);
+        ggml_tensor * out = ggml_mul_mat(ctx0, xt, wr);            // [n_embd, 1, nt]
+        return ggml_reshape_2d(ctx0, out, n_embd, nt);
+    }
 
     ggml_tensor * acc = nullptr;
     for (int64_t ih = 0; ih < hc; ++ih) {
@@ -258,9 +272,52 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_weighted_sum(ggml_t
     return acc;
 }
 
+bool llama_model_openpangu_v2::sinkhorn_fused() const {
+    if (sinkhorn_fused_probe < 0) {
+        sinkhorn_fused_probe = 1;
+
+        for (const llama_device & ldev : devices) {
+            if (ldev.is_meta) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ldev.dev;
+
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead()*8,
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx { ggml_init(params) };
+            GGML_ASSERT(ctx);
+
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+            ggml_backend_buffer_ptr    buf  { ggml_backend_buft_alloc_buffer(buft, 0) };
+
+            ggml_tensor * a  = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 4, 4, 1);
+            ggml_tensor * op = ggml_sinkhorn(ctx.get(), a, 20, 1e-6f);
+            a->buffer = buf.get();
+
+            if (!ggml_backend_dev_supports_op(dev, op)) {
+                LLAMA_LOG_WARN("%s: device %s does not support GGML_OP_SINKHORN - using the unfused op sequence\n",
+                        __func__, ggml_backend_dev_name(dev));
+                sinkhorn_fused_probe = 0;
+                break;
+            }
+        }
+    }
+    return sinkhorn_fused_probe != 0;
+}
+
 ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_sinkhorn(ggml_tensor * comb, int il) const {
     GGML_UNUSED(il);
 
+    if (use_fused_sinkhorn) {
+        // fused softmax + eps + alternating row/column normalization: one op instead
+        // of the ~8 nodes x 2 x n_iter the unfused form needs per [hc, hc] matrix
+        return ggml_sinkhorn(ctx0, comb, hparams.dsv4_hc_sinkhorn_iters, hparams.dsv4_hc_eps);
+    }
+
+    // unfused fallback for backends without GGML_OP_SINKHORN (numerically equivalent)
     comb = ggml_soft_max(ctx0, comb);
 
     ggml_tensor * eps = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
@@ -288,7 +345,8 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_sinkhorn(ggml_tenso
     return comb;
 }
 
-ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_pre(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
+ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_pre(ggml_tensor * x, ggml_tensor * xt,
+        ggml_tensor * hc_fn, ggml_tensor * hc_scale,
         ggml_tensor * hc_base, ggml_tensor ** post, ggml_tensor ** comb, int il) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc * n_embd;
@@ -321,14 +379,29 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_pre(ggml_tensor * x
     *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
     *comb = build_hc_sinkhorn(*comb, il);
 
-    return build_hc_weighted_sum(x, pre);
+    return build_hc_weighted_sum(x, xt, pre);
 }
 
 ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_post(ggml_tensor * x, ggml_tensor * residual,
-        ggml_tensor * post, ggml_tensor * comb, int il) const {
+        ggml_tensor * residual_t, ggml_tensor * post, ggml_tensor * comb, int il) const {
     GGML_UNUSED(il);
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[1];
+
+    if (residual_t) {
+        // merged[e,dst,t] = sum_src residual_t[src,e,t] * comb[dst,src,t]: batched matmul.
+        // comb is laid out [dst, src, t]; mul_mat contracts dim0, so transpose the
+        // (tiny) mixing matrix to [src, dst, t] first
+        ggml_tensor * comb_t = ggml_cont(ctx0, ggml_permute(ctx0, comb, 1, 0, 2, 3));
+        ggml_tensor * merged = ggml_mul_mat(ctx0, residual_t, comb_t); // [n_embd, hc, nt]
+
+        // xpost[e,dst,t] = x[e,t] * post[dst,t]: rank-1 outer product per token
+        ggml_tensor * xr    = ggml_reshape_3d(ctx0, x, 1, n_embd, nt);
+        ggml_tensor * pr    = ggml_reshape_3d(ctx0, post, 1, hc, nt);
+        ggml_tensor * xpost = ggml_mul_mat(ctx0, xr, pr);              // [n_embd, hc, nt]
+
+        return ggml_add(ctx0, merged, xpost);
+    }
 
     ggml_tensor * out = nullptr;
     for (int64_t dst = 0; dst < hc; ++dst) {
@@ -360,7 +433,10 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_head(ggml_tensor * 
     ggml_tensor * pre = opv2_hc_affine(ctx0, mixes, hc_scale, hc_base);
     pre = ggml_sigmoid(ctx0, pre);
 
-    return build_hc_weighted_sum(x, pre);
+    ggml_tensor * xt = nt <= OPV2_HC_BATCHED_NT_MAX
+        ? ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 0, 2, 3))                // [hc, n_embd, nt]
+        : nullptr;
+    return build_hc_weighted_sum(x, xt, pre);
 }
 
 ggml_tensor * llama_model_openpangu_v2::graph_base::build_mome_conv(ggml_tensor * x, ggml_tensor * conv_w,
@@ -711,7 +787,7 @@ std::unique_ptr<llm_graph_context> llama_model_openpangu_v2::build_arch_graph(co
 }
 
 llama_model_openpangu_v2::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    graph_base(params) {
+    graph_base(params, static_cast<const llama_model_openpangu_v2 &>(model).sinkhorn_fused()) {
     GGML_ASSERT(n_layer > 0 && "openpangu-v2: no trunk layers -- a split MTP-only GGUF can only be used as --model-draft with --mtp");
 
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -736,18 +812,27 @@ llama_model_openpangu_v2::graph::graph(const llama_model & model, const llm_grap
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
 
+    // transposed stream state [hc, n_embd, nt] for the batched-matmul mHC form,
+    // shared by the pre- and post-merge of a block; null selects the loop form
+    auto make_xt = [&](ggml_tensor * s) -> ggml_tensor * {
+        return s->ne[2] <= OPV2_HC_BATCHED_NT_MAX
+            ? ggml_cont(ctx0, ggml_permute(ctx0, s, 1, 0, 2, 3))
+            : nullptr;
+    };
+
     for (int il = 0; il < n_layer; ++il) {
-        ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
 
         // attention block
-        cur = build_hc_pre(inpL, model.layers[il].hc_attn_fn, model.layers[il].hc_attn_scale,
+        ggml_tensor * residual   = inpL;
+        ggml_tensor * residual_t = make_xt(inpL);
+        cur = build_hc_pre(inpL, residual_t, model.layers[il].hc_attn_fn, model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base, &post, &comb, il);
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cur = build_attention(model, inp_hybrid, cur, inp_pos, kq_scale, il);
         cur = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, residual_t, post, comb, il);
 
         // the last layer's FFN only needs the requested output rows -- gather early,
         // unless the unmasked MTP extraction needs the full-length hidden state
@@ -759,15 +844,16 @@ llama_model_openpangu_v2::graph::graph(const llama_model & model, const llm_grap
         }
 
         // feed-forward block
-        residual = inpL;
-        cur = build_hc_pre(inpL, model.layers[il].hc_ffn_fn, model.layers[il].hc_ffn_scale,
+        residual   = inpL;
+        residual_t = make_xt(inpL);
+        cur = build_hc_pre(inpL, residual_t, model.layers[il].hc_ffn_fn, model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base, &post, &comb, il);
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
 
         cur = build_moe_block(model, cur, il);
 
         cur = build_norm(cur, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, il);
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, residual_t, post, comb, il);
 
         // block post norm on the stream-concatenated residual (subset of layers)
         if (model.layers[il].block_post_norm) {
@@ -803,7 +889,7 @@ llama_model_openpangu_v2::graph::graph(const llama_model & model, const llm_grap
 }
 
 llama_model_openpangu_v2::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
-    graph_base(params) {
+    graph_base(params, static_cast<const llama_model_openpangu_v2 &>(model).sinkhorn_fused()) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "openpangu-v2 MTP requires n_layer_nextn > 0");
 
     const int il = hparams.n_layer() + cparams.nextn_layer_offset;
