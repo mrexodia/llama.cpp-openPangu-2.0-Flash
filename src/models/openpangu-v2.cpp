@@ -694,7 +694,8 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention(const llama_
         }
 
         const int64_t n_top_k = std::min<int64_t>(iscore->ne[0], hparams.indexer_top_k);
-        ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, iscore, n_top_k));
+        // GGML_OP_TOP_K output is already contiguous (the cont dated from the argsort+view form)
+        ggml_tensor * top_k = ggml_top_k(ctx0, iscore, n_top_k);
 
         if (nt == 1) {
             // gather-based decode attention: physically gather the selected rows and
