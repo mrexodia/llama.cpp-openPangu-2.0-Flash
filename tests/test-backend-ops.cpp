@@ -9025,6 +9025,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
         }
     }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {102400, 8, 1, 1}, 2048)); // DSA indexer selection (CUDA radix select)
     for (int i = 0; i < 20; ++i) {
         for (int k : {1, 2, 3, 7, 15, 100, 500, 1023, 9999}) {
             if (k <= 1<<i) {
