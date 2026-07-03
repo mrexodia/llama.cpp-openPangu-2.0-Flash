@@ -2275,6 +2275,61 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
 
 // ggml_compute_forward_sinkhorn
 
+// shared by GGML_OP_SINKHORN and GGML_OP_HC_MIX: softmax along dim0, add eps,
+// then alternating dim1/dim0 normalization of the [ne0, ne1] matrix m
+static void ggml_sinkhorn_matrix(float * m, const int64_t ne0, const int64_t ne1, const int n_iter, const float eps) {
+    const int64_t nm = ne0*ne1;
+
+    // softmax along dim0, per i1
+    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+        float * c = m + i1*ne0;
+        float vmax = c[0];
+        for (int64_t i0 = 1; i0 < ne0; ++i0) {
+            vmax = MAX(vmax, c[i0]);
+        }
+        float sum = 0.0f;
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            c[i0] = expf(c[i0] - vmax);
+            sum += c[i0];
+        }
+        // reciprocal multiply to match ggml_soft_max rounding
+        const float inv = 1.0f/sum;
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            c[i0] *= inv;
+        }
+    }
+
+    // add eps to every element
+    for (int64_t i = 0; i < nm; ++i) {
+        m[i] += eps;
+    }
+
+    for (int it = 0; it < n_iter; ++it) {
+        // normalize along dim0, per i1 (skipped on the first pass)
+        if (it > 0) {
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                float sum = eps;
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    sum += m[i0 + i1*ne0];
+                }
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    m[i0 + i1*ne0] /= sum;
+                }
+            }
+        }
+        // normalize along dim1, per i0
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            float sum = eps;
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                sum += m[i0 + i1*ne0];
+            }
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                m[i0 + i1*ne0] /= sum;
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_sinkhorn(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
@@ -2303,65 +2358,59 @@ void ggml_compute_forward_sinkhorn(const ggml_compute_params * params, ggml_tens
 
         memcpy(m, sp, nm*sizeof(float));
 
-        // softmax along dim0, per i1
-        for (int64_t i1 = 0; i1 < ne1; ++i1) {
-            float * c = m + i1*ne0;
-            float vmax = c[0];
-            for (int64_t i0 = 1; i0 < ne0; ++i0) {
-                vmax = MAX(vmax, c[i0]);
-            }
-            float sum = 0.0f;
-            for (int64_t i0 = 0; i0 < ne0; ++i0) {
-                c[i0] = expf(c[i0] - vmax);
-                sum += c[i0];
-            }
-            // reciprocal multiply to match ggml_soft_max rounding
-            const float inv = 1.0f/sum;
-            for (int64_t i0 = 0; i0 < ne0; ++i0) {
-                c[i0] *= inv;
-            }
-        }
-
-        // add eps to every element
-        for (int64_t i = 0; i < nm; ++i) {
-            m[i] += eps;
-        }
-
-        // normalize along dim1, per i0
-        auto norm_d1 = [&]() {
-            for (int64_t i0 = 0; i0 < ne0; ++i0) {
-                float sum = 0.0f;
-                for (int64_t i1 = 0; i1 < ne1; ++i1) {
-                    sum += m[i0 + i1*ne0];
-                }
-                sum += eps;
-                for (int64_t i1 = 0; i1 < ne1; ++i1) {
-                    m[i0 + i1*ne0] /= sum;
-                }
-            }
-        };
-
-        // normalize along dim0, per i1
-        auto norm_d0 = [&]() {
-            for (int64_t i1 = 0; i1 < ne1; ++i1) {
-                float sum = 0.0f;
-                for (int64_t i0 = 0; i0 < ne0; ++i0) {
-                    sum += m[i0 + i1*ne0];
-                }
-                sum += eps;
-                for (int64_t i0 = 0; i0 < ne0; ++i0) {
-                    m[i0 + i1*ne0] /= sum;
-                }
-            }
-        };
-
-        norm_d1();
-        for (int it = 1; it < n_iter; ++it) {
-            norm_d0();
-            norm_d1();
-        }
+        ggml_sinkhorn_matrix(m, ne0, ne1, n_iter, eps);
 
         memcpy(dp, m, nm*sizeof(float));
+    }
+}
+
+// ggml_compute_forward_hc_mix
+
+void ggml_compute_forward_hc_mix(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0  = dst->src[0]; // mixes [2*hc + hc*hc, nt]
+    const ggml_tensor * scale = dst->src[1]; // [3]
+    const ggml_tensor * base  = dst->src[2]; // [2*hc + hc*hc]
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int     hc     = ggml_get_op_params_i32(dst, 0);
+    const int     n_iter = ggml_get_op_params_i32(dst, 1);
+    const float   eps    = ggml_get_op_params_f32(dst, 2);
+
+    const int64_t n0 = src0->ne[0];
+    const int64_t nt = src0->ne[1]*src0->ne[2]*src0->ne[3];
+
+    GGML_ASSERT(n0 == 2*hc + hc*hc);
+
+    const float * sc = (const float *) scale->data;
+    const float * bs = (const float *) base->data;
+
+    // parallelize over the tokens
+    const int64_t dt = (nt + params->nth - 1)/params->nth;
+    const int64_t t0 = dt*params->ith;
+    const int64_t t1 = MIN(t0 + dt, nt);
+
+    float m[64];
+
+    for (int64_t t = t0; t < t1; ++t) {
+        const float * sp = (const float *) src0->data + t*n0;
+              float * dp = (float *)       dst->data + t*n0;
+
+        for (int i = 0; i < hc; ++i) {
+            dp[i] = 1.0f/(1.0f + expf(-(sp[i]*sc[0] + bs[i]))) + eps;                    // pre
+        }
+        for (int i = hc; i < 2*hc; ++i) {
+            dp[i] = 2.0f/(1.0f + expf(-(sp[i]*sc[1] + bs[i])));                          // post
+        }
+        for (int i = 2*hc; i < (int) n0; ++i) {
+            m[i - 2*hc] = sp[i]*sc[2] + bs[i];                                           // comb
+        }
+
+        ggml_sinkhorn_matrix(m, hc, hc, n_iter, eps);
+
+        memcpy(dp + 2*hc, m, hc*hc*sizeof(float));
     }
 }
 

@@ -555,6 +555,7 @@ extern "C" {
         GGML_OP_TRI,
         GGML_OP_FILL,
         GGML_OP_SINKHORN,
+        GGML_OP_HC_MIX,
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
@@ -2367,6 +2368,20 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_sinkhorn(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            int                   n_iter,
+            float                 eps);
+
+    // Hyper-connection stream mixing: for each token (rows of a [2*hc+hc*hc, nt]):
+    //   out[0     .. hc)      = sigmoid(a*scale[0] + base[i]) + eps            (pre)
+    //   out[hc    .. 2*hc)    = 2*sigmoid(a*scale[1] + base[i])                (post)
+    //   out[2*hc  .. 2*hc+hc*hc) = sinkhorn(a*scale[2] + base[i], n_iter, eps) (comb,
+    //       the [hc, hc] matrix laid out dim0-major, same semantics as ggml_sinkhorn)
+    GGML_API struct ggml_tensor * ggml_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * scale,  // [3]
+            struct ggml_tensor  * base,   // [2*hc+hc*hc]
+            int                   hc,
             int                   n_iter,
             float                 eps);
 

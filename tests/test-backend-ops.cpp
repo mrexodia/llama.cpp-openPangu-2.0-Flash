@@ -6951,6 +6951,36 @@ struct test_sinkhorn : public test_case {
     }
 };
 
+// GGML_OP_HC_MIX
+struct test_hc_mix : public test_case {
+    const int   hc;
+    const int64_t nt;
+    const int   n_iter;
+    const float eps;
+
+    std::string vars() override { return VARS_TO_STR4(hc, nt, n_iter, eps); }
+
+    test_hc_mix(int hc = 4, int64_t nt = 37, int n_iter = 20, float eps = 1e-6f)
+        : hc(hc), nt(nt), n_iter(n_iter), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n0 = 2*hc + hc*hc;
+
+        ggml_tensor * a     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n0, nt);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_tensor * base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n0);
+        ggml_set_name(a, "a");
+        ggml_set_name(scale, "scale");
+        ggml_set_name(base, "base");
+
+        ggml_tensor * out = ggml_hc_mix(ctx, a, scale, base, hc, n_iter, eps);
+
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SOLVE_TRI
 struct test_solve_tri : public test_case {
     const ggml_type              type;
@@ -9096,6 +9126,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sinkhorn({ 4, 4, 512, 1 }, 20, 1e-6f));
     test_cases.emplace_back(new test_sinkhorn({ 3, 5, 33, 2 }, 7, 1e-5f));
     test_cases.emplace_back(new test_sinkhorn({ 8, 8, 1, 1 }, 1, 1e-6f));
+
+    test_cases.emplace_back(new test_hc_mix());
+    test_cases.emplace_back(new test_hc_mix(4, 512, 20, 1e-6f));
+    test_cases.emplace_back(new test_hc_mix(2, 1, 5, 1e-5f));
     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F32, { 2048, 512, 2, 2 }));
 
     test_cases.emplace_back(new test_diag());
