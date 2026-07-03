@@ -65,6 +65,94 @@ static __global__ void dsa_score_f32(
     }
 }
 
+// Prefill variant: GEMM-like tiled kernel for large token counts. Each block
+// computes a DSA_TILE_S x DSA_TILE_T output tile; the (transposed) ik tile is
+// staged in shared memory once and reused across all heads, the per-head q tile
+// is restaged each head iteration. Each thread accumulates a 4x2 register tile,
+// so the shared-memory loads amortize over 8 FMAs. Never materializes the
+// [n_kv, nh, nt] intermediate the unfused matmul pipeline needs (~5 GB per
+// layer per 512-token ubatch at 100K context).
+#define DSA_TILE_S       64
+#define DSA_TILE_T       32
+#define DSA_TILE_PS      (DSA_TILE_S + 4)  // padded rows: keeps 8-byte alignment, avoids bank conflicts
+#define DSA_TILE_PT      (DSA_TILE_T + 2)
+#define DSA_TILE_THREADS 256
+#define DSA_TILE_ND_MAX  180               // smem = nd*(PS*2 + PT*4) bytes <= 48 KB
+
+template <typename T_MASK>
+static __global__ void dsa_score_tiled_f32(
+        const char * ik, const float * q, const float * w, const char * mask, float * dst,
+        const int nd, const int64_t nkv, const int nh, const int nt,
+        const int64_t nb_ik_row, const int64_t nb_mask_row) {
+    extern __shared__ char smem_raw[];
+    half  * sik = (half  *)  smem_raw;                                          // [nd][DSA_TILE_PS], transposed
+    float * sq  = (float *) (smem_raw + (size_t) nd*DSA_TILE_PS*sizeof(half));  // [nd][DSA_TILE_PT], transposed
+
+    const int64_t s0 = (int64_t) blockIdx.x*DSA_TILE_S;
+    const int     t0 = blockIdx.y*DSA_TILE_T;
+
+    const int tid = threadIdx.x;
+    const int tt  = tid % (DSA_TILE_T/2);  // covers t = t0 + tt*2 + {0,1}
+    const int ts  = tid / (DSA_TILE_T/2);  // covers s = s0 + ts*4 + {0..3}
+
+    // ik tile: coalesced global reads (d contiguous per row), transposed store
+    for (int idx = tid; idx < nd*DSA_TILE_S; idx += DSA_TILE_THREADS) {
+        const int d = idx % nd;
+        const int s = idx / nd;
+        sik[d*DSA_TILE_PS + s] = s0 + s < nkv ? ((const half *) (ik + (s0 + s)*nb_ik_row))[d] : __float2half(0.0f);
+    }
+
+    float acc[4][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+
+    for (int h = 0; h < nh; ++h) {
+        __syncthreads();  // also covers the sik stores on the first iteration
+        for (int idx = tid; idx < nd*DSA_TILE_T; idx += DSA_TILE_THREADS) {
+            const int d = idx % nd;
+            const int t = idx / nd;
+            sq[d*DSA_TILE_PT + t] = t0 + t < nt ? q[((size_t) (t0 + t)*nh + h)*nd + d] : 0.0f;
+        }
+        __syncthreads();
+
+        float dot[4][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+        for (int d = 0; d < nd; ++d) {
+            const half2 * a    = (const half2 *) (sik + d*DSA_TILE_PS + ts*4);
+            const float2  a01  = __half22float2(a[0]);
+            const float2  a23  = __half22float2(a[1]);
+            const float2  b    = *(const float2 *) (sq + d*DSA_TILE_PT + tt*2);
+            dot[0][0] += a01.x*b.x; dot[0][1] += a01.x*b.y;
+            dot[1][0] += a01.y*b.x; dot[1][1] += a01.y*b.y;
+            dot[2][0] += a23.x*b.x; dot[2][1] += a23.x*b.y;
+            dot[3][0] += a23.y*b.x; dot[3][1] += a23.y*b.y;
+        }
+
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int t = t0 + tt*2 + j;
+            const float wv = t < nt ? w[(size_t) t*nh + h] : 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[i][j] += wv*fmaxf(dot[i][j], 0.0f);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int t = t0 + tt*2 + j;
+        if (t >= nt) {
+            continue;
+        }
+        const T_MASK * mask_row = (const T_MASK *) (mask + (size_t) t*nb_mask_row);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int64_t s = s0 + ts*4 + i;
+            if (s < nkv) {
+                dst[(size_t) t*nkv + s] = acc[i][j] + (float) mask_row[s];
+            }
+        }
+    }
+}
+
 void ggml_cuda_op_dsa_score(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * ik   = dst->src[0];
     const ggml_tensor * q    = dst->src[1];
@@ -80,6 +168,25 @@ void ggml_cuda_op_dsa_score(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int     nt  = (int) q->ne[2];
 
     GGML_ASSERT(nd <= 8*WARP_SIZE);
+
+    // large token counts (prefill): tiled kernel, one output tile per block
+    if (nt >= 16 && ik->type == GGML_TYPE_F16 && nd <= DSA_TILE_ND_MAX) {
+        const dim3 grid((nkv + DSA_TILE_S - 1)/DSA_TILE_S, (nt + DSA_TILE_T - 1)/DSA_TILE_T, 1);
+        const size_t smem = (size_t) nd*(DSA_TILE_PS*sizeof(half) + DSA_TILE_PT*sizeof(float));
+
+        if (mask->type == GGML_TYPE_F16) {
+            dsa_score_tiled_f32<half><<<grid, DSA_TILE_THREADS, smem, ctx.stream()>>>(
+                    (const char *) ik->data, (const float *) q->data, (const float *) w->data,
+                    (const char *) mask->data, (float *) dst->data,
+                    nd, nkv, nh, nt, ik->nb[1], mask->nb[1]);
+        } else {
+            dsa_score_tiled_f32<float><<<grid, DSA_TILE_THREADS, smem, ctx.stream()>>>(
+                    (const char *) ik->data, (const float *) q->data, (const float *) w->data,
+                    (const char *) mask->data, (float *) dst->data,
+                    nd, nkv, nh, nt, ik->nb[1], mask->nb[1]);
+        }
+        return;
+    }
 
     const int warps_per_block = CUDA_DSA_SCORE_BLOCK_SIZE/WARP_SIZE;
     const dim3 grid((nkv + warps_per_block - 1)/warps_per_block, nt, 1);

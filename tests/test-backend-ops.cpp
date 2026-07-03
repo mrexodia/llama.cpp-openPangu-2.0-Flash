@@ -9167,6 +9167,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsa_score(128, 2560, 24, 4, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsa_score(64, 1000, 8, 2, GGML_TYPE_F32));
     test_cases.emplace_back(new test_dsa_score(128, 102400, 24, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsa_score(128, 4096, 24, 512, GGML_TYPE_F16)); // CUDA tiled prefill kernel
+    test_cases.emplace_back(new test_dsa_score(128, 1000, 24, 100, GGML_TYPE_F16)); // tiled, ragged tiles
+    test_cases.emplace_back(new test_dsa_score(64, 999, 8, 37, GGML_TYPE_F16));     // tiled, nd < tile depth
+    test_cases.emplace_back(new test_dsa_score(128, 4096, 24, 512, GGML_TYPE_F32)); // large-nt fallback (warp kernel)
     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F32, { 2048, 512, 2, 2 }));
 
     test_cases.emplace_back(new test_diag());
