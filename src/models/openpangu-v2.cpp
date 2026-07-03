@@ -257,6 +257,9 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_weighted_sum(ggml_t
 
     if (xt) {
         // out[e,t] = sum_h xt[h,e,t] * w[h,t]: one batched matvec over the streams
+        if (!ggml_is_contiguous(weights)) {
+            weights = ggml_cont(ctx0, weights);                    // hc_mix output views are strided
+        }
         ggml_tensor * wr  = ggml_reshape_3d(ctx0, weights, hc, 1, nt);
         ggml_tensor * out = ggml_mul_mat(ctx0, xt, wr);            // [n_embd, 1, nt]
         return ggml_reshape_2d(ctx0, out, n_embd, nt);
@@ -283,7 +286,7 @@ bool llama_model_openpangu_v2::sinkhorn_fused() const {
             ggml_backend_dev_t dev = ldev.dev;
 
             ggml_init_params params = {
-                /*.mem_size   =*/ ggml_tensor_overhead()*8,
+                /*.mem_size   =*/ ggml_tensor_overhead()*16,
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -293,12 +296,22 @@ bool llama_model_openpangu_v2::sinkhorn_fused() const {
             ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
             ggml_backend_buffer_ptr    buf  { ggml_backend_buft_alloc_buffer(buft, 0) };
 
-            ggml_tensor * a  = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 4, 4, 1);
-            ggml_tensor * op = ggml_sinkhorn(ctx.get(), a, 20, 1e-6f);
-            a->buffer = buf.get();
+            ggml_tensor * a     = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 4, 4, 1);
+            ggml_tensor * mixes = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 24, 1);
+            ggml_tensor * sc    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 3);
+            ggml_tensor * bs    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 24);
 
-            if (!ggml_backend_dev_supports_op(dev, op)) {
-                LLAMA_LOG_WARN("%s: device %s does not support GGML_OP_SINKHORN - using the unfused op sequence\n",
+            ggml_tensor * op_sinkhorn = ggml_sinkhorn(ctx.get(), a, 20, 1e-6f);
+            ggml_tensor * op_hc_mix   = ggml_hc_mix(ctx.get(), mixes, sc, bs, 4, 20, 1e-6f);
+
+            a->buffer     = buf.get();
+            mixes->buffer = buf.get();
+            sc->buffer    = buf.get();
+            bs->buffer    = buf.get();
+
+            if (!ggml_backend_dev_supports_op(dev, op_sinkhorn) ||
+                !ggml_backend_dev_supports_op(dev, op_hc_mix)) {
+                LLAMA_LOG_WARN("%s: device %s does not support the fused hyper-connection ops - using the unfused op sequence\n",
                         __func__, ggml_backend_dev_name(dev));
                 sinkhorn_fused_probe = 0;
                 break;
@@ -356,6 +369,19 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_pre(ggml_tensor * x
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, hparams.f_norm_rms_eps);
     ggml_tensor * mixes     = ggml_mul_mat(ctx0, hc_fn, flat_norm);
 
+    if (use_fused_sinkhorn) {
+        // fused affine + sigmoid gates + sinkhorn: one op instead of ~12 per call
+        ggml_tensor * mixed = ggml_hc_mix(ctx0, mixes, hc_scale, hc_base,
+                (int) hc, (int) hparams.dsv4_hc_sinkhorn_iters, hparams.dsv4_hc_eps);
+
+        const size_t es = ggml_element_size(mixed);
+        ggml_tensor * pre = ggml_view_2d(ctx0, mixed, hc, nt, mixed->nb[1], 0);
+        *post = ggml_view_2d(ctx0, mixed, hc, nt, mixed->nb[1], hc*es);
+        *comb = ggml_view_3d(ctx0, mixed, hc, hc, nt, hc*es, mixed->nb[1], 2*hc*es);
+
+        return build_hc_weighted_sum(x, xt, pre);
+    }
+
     ggml_tensor * scale_pre  = opv2_view_1d(ctx0, hc_scale, 1, 0);
     ggml_tensor * scale_post = opv2_view_1d(ctx0, hc_scale, 1, 1);
     ggml_tensor * scale_comb = opv2_view_1d(ctx0, hc_scale, 1, 2);
@@ -396,6 +422,9 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_hc_post(ggml_tensor * 
         ggml_tensor * merged = ggml_mul_mat(ctx0, residual_t, comb_t); // [n_embd, hc, nt]
 
         // xpost[e,dst,t] = x[e,t] * post[dst,t]: rank-1 outer product per token
+        if (!ggml_is_contiguous(post)) {
+            post = ggml_cont(ctx0, post);                              // hc_mix output views are strided
+        }
         ggml_tensor * xr    = ggml_reshape_3d(ctx0, x, 1, n_embd, nt);
         ggml_tensor * pr    = ggml_reshape_3d(ctx0, post, 1, hc, nt);
         ggml_tensor * xpost = ggml_mul_mat(ctx0, xr, pr);              // [n_embd, hc, nt]
