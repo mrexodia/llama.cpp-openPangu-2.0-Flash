@@ -15,6 +15,9 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that adds full supp
   attention via a hybrid iSWA cache, 4-stream manifold hyper-connections (mHC),
   MoME causal convolutions with recurrent cross-batch state, and 128 learned
   cache-resident attention sinks per layer
+- Fused CUDA/CPU kernels for the mHC mixing chain (`GGML_OP_SINKHORN`,
+  `GGML_OP_HC_MIX`) — decode is ~40% faster than the naive graph, with automatic
+  fallback to the unfused ops on backends without the kernels (e.g. Metal)
 - HF → GGUF conversion (`convert_hf_to_gguf.py`) and a base/MTP split tool
   (`conversion/split_pangu_mtp.py`)
 - Multi-token-prediction self-speculative decoding (`--mtp`, with the split MTP draft GGUF)
@@ -34,15 +37,19 @@ Context scales to `-c 524288`; the compressed MLA KV cache needs only ~12 GB at 
 
 ## Measured performance
 
-DGX Spark (GB10, unified memory), `llama-server` defaults:
+DGX Spark (GB10, unified memory):
 
-| Metric | Q4_K_M | Q8_0 |
+| llama-bench | Q4_K_M | Q8_0 |
 |---|---|---|
-| Prompt processing | 475–690 t/s | ~470 t/s |
-| Generation (short context) | 18–20 t/s | ~15 t/s |
-| Generation @ 24K / 100K | 15.3 / ~9 t/s | — |
+| pp512 | 770 t/s | 575 t/s |
+| tg128 | 38.0 t/s | 23.7 t/s |
 
-Quality (perplexity on clean English prose, `-c 2048`): Q4_K_M **3.46**, Q3_K_M **3.70**.
+| llama-server, Q4_K_M | short | @10K | @24K | @100K |
+|---|---|---|---|---|
+| Prompt processing | — | 525 t/s | 359 t/s | 134 t/s |
+| Generation | ~25 t/s | 21.5 t/s | 18.4 t/s | 10.4 t/s |
+
+Quality (perplexity on clean English prose, `-c 2048`): Q4_K_M **3.45**, Q3_K_M **3.70**.
 Needle-in-a-haystack retrieval validated at 10K, 24K and 100K tokens. MTP drafting reaches
 ~91% acceptance with the split draft model (worthwhile mainly on discrete GPUs).
 
