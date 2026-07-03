@@ -658,9 +658,11 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention(const llama_
         ggml_tensor * iw = ggml_mul_mat(ctx0, layer.indexer_proj, cur);          // [idx_h, nt]
 
         ggml_tensor * iscore;
-        if (use_fused_sinkhorn && nt <= OPV2_HC_BATCHED_NT_MAX) {
-            // decode: one fused pass over the cached indexer keys (incl. relu,
-            // head-weighting and the additive mask)
+        if (use_fused_sinkhorn && k_row->ne[3] == 1) {
+            // one fused pass over the cached indexer keys (incl. relu, head-weighting
+            // and the additive mask); the CUDA backend has a warp-per-position decode
+            // kernel and a tiled prefill kernel, so no [n_kv, nh, nt] intermediate is
+            // ever materialized. multi-stream caches fall back to the matmul pipeline.
             ggml_tensor * ikv = ggml_view_2d(ctx0, k_row, idx_d, k_row->ne[2] - n_pfx, k_row->nb[2],
                     n_pfx*k_row->nb[2] + ggml_row_size(k_row->type, kv_lora_rank + n_embd_head_qk_rope));
             iscore = ggml_dsa_score(ctx0, ikv, indexer_q, iw, kq_mask);          // [n_kv, nt]
