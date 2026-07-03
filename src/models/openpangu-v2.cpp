@@ -300,17 +300,27 @@ bool llama_model_openpangu_v2::sinkhorn_fused() const {
             ggml_tensor * mixes = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 24, 1);
             ggml_tensor * sc    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 3);
             ggml_tensor * bs    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 24);
+            ggml_tensor * ik    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, 128, 16);
+            ggml_tensor * dq    = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 128, 24, 1);
+            ggml_tensor * dw    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 24, 1);
+            ggml_tensor * dm    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, 16, 1);
 
-            ggml_tensor * op_sinkhorn = ggml_sinkhorn(ctx.get(), a, 20, 1e-6f);
-            ggml_tensor * op_hc_mix   = ggml_hc_mix(ctx.get(), mixes, sc, bs, 4, 20, 1e-6f);
+            ggml_tensor * op_sinkhorn  = ggml_sinkhorn(ctx.get(), a, 20, 1e-6f);
+            ggml_tensor * op_hc_mix    = ggml_hc_mix(ctx.get(), mixes, sc, bs, 4, 20, 1e-6f);
+            ggml_tensor * op_dsa_score = ggml_dsa_score(ctx.get(), ik, dq, dw, dm);
 
             a->buffer     = buf.get();
             mixes->buffer = buf.get();
             sc->buffer    = buf.get();
             bs->buffer    = buf.get();
+            ik->buffer    = buf.get();
+            dq->buffer    = buf.get();
+            dw->buffer    = buf.get();
+            dm->buffer    = buf.get();
 
             if (!ggml_backend_dev_supports_op(dev, op_sinkhorn) ||
-                !ggml_backend_dev_supports_op(dev, op_hc_mix)) {
+                !ggml_backend_dev_supports_op(dev, op_hc_mix)   ||
+                !ggml_backend_dev_supports_op(dev, op_dsa_score)) {
                 LLAMA_LOG_WARN("%s: device %s does not support the fused hyper-connection ops - using the unfused op sequence\n",
                         __func__, ggml_backend_dev_name(dev));
                 sinkhorn_fused_probe = 0;
@@ -647,49 +657,91 @@ ggml_tensor * llama_model_openpangu_v2::graph_base::build_attention(const llama_
 
         ggml_tensor * iw = ggml_mul_mat(ctx0, layer.indexer_proj, cur);          // [idx_h, nt]
 
-        // split the batch into streams if needed
-        const int64_t n_stream = ik_cache->ne[3];
-        indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream,
-                indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
-        iw = ggml_view_4d(ctx0, iw, iw->ne[0], iw->ne[1]/n_stream, iw->ne[2], n_stream,
-                iw->nb[1], iw->nb[2]/n_stream, iw->nb[3]/n_stream, 0);
+        ggml_tensor * iscore;
+        if (use_fused_sinkhorn && nt <= OPV2_HC_BATCHED_NT_MAX) {
+            // decode: one fused pass over the cached indexer keys (incl. relu,
+            // head-weighting and the additive mask)
+            ggml_tensor * ikv = ggml_view_2d(ctx0, k_row, idx_d, k_row->ne[2] - n_pfx, k_row->nb[2],
+                    n_pfx*k_row->nb[2] + ggml_row_size(k_row->type, kv_lora_rank + n_embd_head_qk_rope));
+            iscore = ggml_dsa_score(ctx0, ikv, indexer_q, iw, kq_mask);          // [n_kv, nt]
+        } else {
+            // prefill: tiled matmul pipeline
+            // split the batch into streams if needed
+            const int64_t n_stream = ik_cache->ne[3];
+            indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream,
+                    indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
+            iw = ggml_view_4d(ctx0, iw, iw->ne[0], iw->ne[1]/n_stream, iw->ne[2], n_stream,
+                    iw->nb[1], iw->nb[2]/n_stream, iw->nb[3]/n_stream, 0);
 
-        indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);                   // [idx_d, nt, idx_h]
-        ik_cache  = ggml_permute(ctx0, ik_cache,  0, 2, 1, 3);                   // [idx_d, n_kv, 1]
+            indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);               // [idx_d, nt, idx_h]
+            ik_cache  = ggml_permute(ctx0, ik_cache,  0, 2, 1, 3);               // [idx_d, n_kv, 1]
 
-        ggml_tensor * ikq = ggml_mul_mat(ctx0, ik_cache, indexer_q);             // [n_kv, nt, idx_h]
-        ikq = ggml_relu(ctx0, ikq);                                              // contiguous, no cont needed
-        ikq = ggml_cont(ctx0, ggml_permute(ctx0, ikq, 1, 2, 0, 3));              // [idx_h, n_kv, nt]
+            ggml_tensor * ikq = ggml_mul_mat(ctx0, ik_cache, indexer_q);         // [n_kv, nt, idx_h]
+            ikq = ggml_relu(ctx0, ikq);                                          // contiguous, no cont needed
+            ikq = ggml_cont(ctx0, ggml_permute(ctx0, ikq, 1, 2, 0, 3));          // [idx_h, n_kv, nt]
 
-        // weighted sum over the heads as a batched matvec
-        ggml_tensor * iwv = ggml_view_4d(ctx0, iw, iw->ne[0], 1, iw->ne[1], iw->ne[3],
-                iw->nb[2], iw->nb[1], iw->nb[3], 0);                             // [idx_h, 1, nt]
-        ggml_tensor * iscore = ggml_mul_mat(ctx0, ikq, iwv);                     // [n_kv, 1, nt]
-        iscore = ggml_reshape_4d(ctx0, iscore, iscore->ne[0], iscore->ne[2], 1, iscore->ne[3]); // [n_kv, nt, 1]
+            // weighted sum over the heads as a batched matvec
+            ggml_tensor * iwv = ggml_view_4d(ctx0, iw, iw->ne[0], 1, iw->ne[1], iw->ne[3],
+                    iw->nb[2], iw->nb[1], iw->nb[3], 0);                         // [idx_h, 1, nt]
+            iscore = ggml_mul_mat(ctx0, ikq, iwv);                               // [n_kv, 1, nt]
+            iscore = ggml_reshape_4d(ctx0, iscore, iscore->ne[0], iscore->ne[2], 1, iscore->ne[3]); // [n_kv, nt, 1]
 
-        // mask before top-k so invalid/future cells cannot claim slots
-        iscore = ggml_add(ctx0, iscore,
-                kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32));
+            // mask before top-k so invalid/future cells cannot claim slots
+            iscore = ggml_add(ctx0, iscore,
+                    kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32));
+        }
 
         const int64_t n_top_k = std::min<int64_t>(iscore->ne[0], hparams.indexer_top_k);
         ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, iscore, n_top_k));
 
-        // unmask the selected cells on an all-masked copy, then AND with the causal mask
-        // (same construction as the DSA build_attn overload in llama-graph.cpp)
-        ggml_tensor * mask_inf = ggml_fill(ctx0, kq_mask, -INFINITY);
-        mask_inf = ggml_view_4d(ctx0, mask_inf, 1, mask_inf->ne[0], mask_inf->ne[1], mask_inf->ne[3],
-                mask_inf->nb[0], mask_inf->nb[1], mask_inf->nb[2], 0);
-        ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
-                top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
-        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-        zeros = ggml_fill(ctx0, zeros, 0.0f);
-        ggml_tensor * unmasked = ggml_set_rows(ctx0, mask_inf, zeros, top_k_3d);
-        unmasked = ggml_view_4d(ctx0, unmasked, unmasked->ne[1], unmasked->ne[2], 1, unmasked->ne[3],
-                unmasked->nb[2], unmasked->nb[3], unmasked->nb[3], 0);
-        kq_mask = ggml_add(ctx0, unmasked, kq_mask);
+        if (nt == 1) {
+            // gather-based decode attention: physically gather the selected rows and
+            // attend over [sinks | top-k] only -- attention cost stays constant with
+            // context instead of reading (and masking) the entire cache
+            ggml_tensor * ids = ggml_reshape_1d(ctx0, top_k, n_top_k);
 
-        // per-DSA-layer combined mask (the top-k selection differs per layer)
-        kq_mask_all = ggml_concat(ctx0, sink_mask_blk, kq_mask, 0);
+            ggml_tensor * cells = ggml_view_2d(ctx0, k_row, k_row->ne[0], k_row->ne[2] - n_pfx,
+                    k_row->nb[2], n_pfx*k_row->nb[2]);                       // [row_w, n_kv]
+            ggml_tensor * gk = ggml_get_rows(ctx0, cells, ids);              // [row_w, n_top_k] F32
+            gk = ggml_cast(ctx0, gk, k_row->type);
+
+            ggml_tensor * prefix = ggml_view_2d(ctx0, k_row, k_row->ne[0], n_pfx, k_row->nb[2], 0);
+            ggml_tensor * kg = ggml_concat(ctx0, prefix, gk, 1);             // [row_w, n_pfx+n_top_k]
+
+            const int64_t n_rows = n_pfx + n_top_k;
+            k = ggml_view_4d(ctx0, kg, kv_lora_rank + n_embd_head_qk_rope, 1, n_rows, 1,
+                    kg->nb[1], kg->nb[1], kg->nb[1]*n_rows, 0);
+            v = ggml_view_4d(ctx0, kg, kv_lora_rank, 1, n_rows, 1,
+                    kg->nb[1], kg->nb[1], kg->nb[1]*n_rows, 0);
+
+            // gather the mask entries of the selected cells (keeps padding/other-seq
+            // cells that sneak into the top-k masked out)
+            ggml_tensor * m_r = ggml_reshape_2d(ctx0, kq_mask, 1, kq_mask->ne[0]);
+            ggml_tensor * gm  = ggml_get_rows(ctx0, m_r, ids);               // [1, n_top_k] F32
+            gm = ggml_reshape_2d(ctx0, gm, n_top_k, 1);
+            if (gm->type != sink_mask_blk->type) {
+                gm = ggml_cast(ctx0, gm, sink_mask_blk->type);
+            }
+            kq_mask_all = ggml_concat(ctx0, sink_mask_blk, gm, 0);           // [n_pfx+n_top_k, 1]
+        } else {
+            // prefill: every query has its own top-k set, so keep the mask-based form --
+            // unmask the selected cells on an all-masked copy, then AND with the causal
+            // mask (same construction as the DSA build_attn overload in llama-graph.cpp)
+            ggml_tensor * mask_inf = ggml_fill(ctx0, kq_mask, -INFINITY);
+            mask_inf = ggml_view_4d(ctx0, mask_inf, 1, mask_inf->ne[0], mask_inf->ne[1], mask_inf->ne[3],
+                    mask_inf->nb[0], mask_inf->nb[1], mask_inf->nb[2], 0);
+            ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
+                    top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+            ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+            zeros = ggml_fill(ctx0, zeros, 0.0f);
+            ggml_tensor * unmasked = ggml_set_rows(ctx0, mask_inf, zeros, top_k_3d);
+            unmasked = ggml_view_4d(ctx0, unmasked, unmasked->ne[1], unmasked->ne[2], 1, unmasked->ne[3],
+                    unmasked->nb[2], unmasked->nb[3], unmasked->nb[3], 0);
+            kq_mask = ggml_add(ctx0, unmasked, kq_mask);
+
+            // per-DSA-layer combined mask (the top-k selection differs per layer)
+            kq_mask_all = ggml_concat(ctx0, sink_mask_blk, kq_mask, 0);
+        }
     }
 
     ggml_tensor * attn_out = build_attn_mha(Qcur, k, v, nullptr, kq_mask_all, nullptr, layer.wv_b, kq_scale, il);
