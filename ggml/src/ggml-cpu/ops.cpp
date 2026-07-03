@@ -2273,6 +2273,98 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
     }
 }
 
+// ggml_compute_forward_sinkhorn
+
+void ggml_compute_forward_sinkhorn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int     n_iter = ggml_get_op_params_i32(dst, 0);
+    const float   eps    = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t ne0 = src0->ne[0];
+    const int64_t ne1 = src0->ne[1];
+    const int64_t nm  = ne0*ne1;      // per-batch matrix size (<= 64, asserted at build)
+    const int64_t nb  = src0->ne[2]*src0->ne[3];
+
+    // parallelize over the (i2, i3) batches
+    const int64_t db = (nb + params->nth - 1)/params->nth;
+    const int64_t b0 = db*params->ith;
+    const int64_t b1 = MIN(b0 + db, nb);
+
+    float m[64];
+
+    for (int64_t b = b0; b < b1; ++b) {
+        const float * sp = (const float *) src0->data + b*nm;
+              float * dp = (float *)       dst->data + b*nm;
+
+        memcpy(m, sp, nm*sizeof(float));
+
+        // softmax along dim0, per i1
+        for (int64_t i1 = 0; i1 < ne1; ++i1) {
+            float * c = m + i1*ne0;
+            float vmax = c[0];
+            for (int64_t i0 = 1; i0 < ne0; ++i0) {
+                vmax = MAX(vmax, c[i0]);
+            }
+            float sum = 0.0f;
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                c[i0] = expf(c[i0] - vmax);
+                sum += c[i0];
+            }
+            // reciprocal multiply to match ggml_soft_max rounding
+            const float inv = 1.0f/sum;
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                c[i0] *= inv;
+            }
+        }
+
+        // add eps to every element
+        for (int64_t i = 0; i < nm; ++i) {
+            m[i] += eps;
+        }
+
+        // normalize along dim1, per i0
+        auto norm_d1 = [&]() {
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                float sum = 0.0f;
+                for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                    sum += m[i0 + i1*ne0];
+                }
+                sum += eps;
+                for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                    m[i0 + i1*ne0] /= sum;
+                }
+            }
+        };
+
+        // normalize along dim0, per i1
+        auto norm_d0 = [&]() {
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                float sum = 0.0f;
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    sum += m[i0 + i1*ne0];
+                }
+                sum += eps;
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    m[i0 + i1*ne0] /= sum;
+                }
+            }
+        };
+
+        norm_d1();
+        for (int it = 1; it < n_iter; ++it) {
+            norm_d0();
+            norm_d1();
+        }
+
+        memcpy(dp, m, nm*sizeof(float));
+    }
+}
+
 // ggml_compute_tri
 
 static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggml_tensor * dst) {

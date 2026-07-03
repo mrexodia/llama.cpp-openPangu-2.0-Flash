@@ -554,6 +554,7 @@ extern "C" {
         GGML_OP_LEAKY_RELU,
         GGML_OP_TRI,
         GGML_OP_FILL,
+        GGML_OP_SINKHORN,
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
@@ -2355,6 +2356,19 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 c);
+
+    // Sinkhorn row/column normalization over the leading [ne0, ne1] matrix of each
+    // (i2, i3) batch (used by hyper-connection stream mixing):
+    //   1. softmax along dim0 (per i1)
+    //   2. add eps to every element
+    //   3. normalize along dim1: M[i0,:] /= (eps + sum_i1 M[i0,i1])
+    //   4. repeat (n_iter-1) times:
+    //        normalize along dim0: M[:,i1] /= (eps + sum_i0 M[i0,i1]), then step 3
+    GGML_API struct ggml_tensor * ggml_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_iter,
+            float                 eps);
 
     // Ref: https://github.com/CompVis/stable-diffusion/blob/main/ldm/modules/diffusionmodules/util.py#L151
     // timesteps: [N,]

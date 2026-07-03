@@ -6928,6 +6928,29 @@ struct test_fill : public test_case {
     }
 };
 
+// GGML_OP_SINKHORN
+struct test_sinkhorn : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int                    n_iter;
+    const float                  eps;
+
+    std::string vars() override { return VARS_TO_STR3(ne, n_iter, eps); }
+
+    test_sinkhorn(std::array<int64_t, 4> ne = { 4, 4, 64, 2 }, int n_iter = 20, float eps = 1e-6f)
+        : ne(ne), n_iter(n_iter), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_sinkhorn(ctx, a, n_iter, eps);
+
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SOLVE_TRI
 struct test_solve_tri : public test_case {
     const ggml_type              type;
@@ -9068,6 +9091,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fill(0.0f));
     test_cases.emplace_back(new test_fill(2.0f, GGML_TYPE_F32, { 303, 207, 11, 3 }));
     test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F32, { 800, 600, 4, 4 }));
+
+    test_cases.emplace_back(new test_sinkhorn());
+    test_cases.emplace_back(new test_sinkhorn({ 4, 4, 512, 1 }, 20, 1e-6f));
+    test_cases.emplace_back(new test_sinkhorn({ 3, 5, 33, 2 }, 7, 1e-5f));
+    test_cases.emplace_back(new test_sinkhorn({ 8, 8, 1, 1 }, 1, 1e-6f));
     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F32, { 2048, 512, 2, 2 }));
 
     test_cases.emplace_back(new test_diag());

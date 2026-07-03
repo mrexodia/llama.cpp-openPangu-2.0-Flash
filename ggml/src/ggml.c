@@ -1047,6 +1047,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LEAKY_RELU",
     "TRI",
     "FILL",
+    "SINKHORN",
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
@@ -1078,7 +1079,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1158,6 +1159,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "leaky_relu(x)",
     "tri(x)",
     "fill(x, c)",
+    "sinkhorn(x)",
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
@@ -1189,7 +1191,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5282,6 +5284,30 @@ struct ggml_tensor * ggml_fill_inplace(
     struct ggml_tensor  * a,
     float                 c) {
     return ggml_fill_impl(ctx, a, c, true);
+}
+
+// ggml_sinkhorn
+
+struct ggml_tensor * ggml_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_iter,
+        float                 eps) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(n_iter >= 1);
+    // the per-batch matrix is kept in registers/stack by the backends
+    GGML_ASSERT(a->ne[0]*a->ne[1] <= 64);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, n_iter);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_SINKHORN;
+    result->src[0] = a;
+
+    return result;
 }
 
 // ggml_argsort
