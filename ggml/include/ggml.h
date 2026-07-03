@@ -556,6 +556,7 @@ extern "C" {
         GGML_OP_FILL,
         GGML_OP_SINKHORN,
         GGML_OP_HC_MIX,
+        GGML_OP_DSA_SCORE,
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
@@ -2384,6 +2385,20 @@ extern "C" {
             int                   hc,
             int                   n_iter,
             float                 eps);
+
+    // DSA lightning-indexer scores (one pass over the cached indexer keys):
+    //   out[s,t] = mask[s,t] + sum_h w[h,t] * relu(sum_d ik[d,s] * q[d,h,t])
+    //   ik:   [d, n_kv]     indexer keys (may be a strided view; F16 or F32)
+    //   q:    [d, h, nt]    per-token indexer queries (F32)
+    //   w:    [h, nt]       per-token head weights (F32)
+    //   mask: [n_kv, nt]    additive mask (F16 or F32)
+    // returns [n_kv, nt] F32
+    GGML_API struct ggml_tensor * ggml_dsa_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ik,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * mask);
 
     // Ref: https://github.com/CompVis/stable-diffusion/blob/main/ldm/modules/diffusionmodules/util.py#L151
     // timesteps: [N,]

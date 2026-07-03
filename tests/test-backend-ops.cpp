@@ -6981,6 +6981,38 @@ struct test_hc_mix : public test_case {
     }
 };
 
+// GGML_OP_DSA_SCORE
+struct test_dsa_score : public test_case {
+    const int64_t nd;
+    const int64_t nkv;
+    const int64_t nh;
+    const int64_t nt;
+    const ggml_type type_ik;
+
+    std::string vars() override { return VARS_TO_STR5(nd, nkv, nh, nt, type_ik); }
+
+    test_dsa_score(int64_t nd = 128, int64_t nkv = 4096, int64_t nh = 24, int64_t nt = 1,
+            ggml_type type_ik = GGML_TYPE_F16)
+        : nd(nd), nkv(nkv), nh(nh), nt(nt), type_ik(type_ik) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ik   = ggml_new_tensor_2d(ctx, type_ik, nd, nkv);
+        ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nd, nh, nt);
+        ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nh, nt);
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nkv, nt);
+        ggml_set_name(ik, "ik");
+        ggml_set_name(q, "q");
+        ggml_set_name(w, "w");
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_dsa_score(ctx, ik, q, w, mask);
+
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SOLVE_TRI
 struct test_solve_tri : public test_case {
     const ggml_type              type;
@@ -9130,6 +9162,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_mix());
     test_cases.emplace_back(new test_hc_mix(4, 512, 20, 1e-6f));
     test_cases.emplace_back(new test_hc_mix(2, 1, 5, 1e-5f));
+
+    test_cases.emplace_back(new test_dsa_score());
+    test_cases.emplace_back(new test_dsa_score(128, 2560, 24, 4, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsa_score(64, 1000, 8, 2, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_dsa_score(128, 102400, 24, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F32, { 2048, 512, 2, 2 }));
 
     test_cases.emplace_back(new test_diag());

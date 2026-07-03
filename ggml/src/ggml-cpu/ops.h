@@ -89,6 +89,7 @@ void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct 
 void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_sinkhorn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_hc_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsa_score(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_back(
         const struct ggml_compute_params * params,

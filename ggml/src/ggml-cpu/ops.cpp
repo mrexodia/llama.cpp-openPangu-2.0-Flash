@@ -2414,6 +2414,61 @@ void ggml_compute_forward_hc_mix(const ggml_compute_params * params, ggml_tensor
     }
 }
 
+// ggml_compute_forward_dsa_score
+
+void ggml_compute_forward_dsa_score(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * ik   = dst->src[0]; // [d, n_kv] (possibly strided rows)
+    const ggml_tensor * q    = dst->src[1]; // [d, h, nt]
+    const ggml_tensor * w    = dst->src[2]; // [h, nt]
+    const ggml_tensor * mask = dst->src[3]; // [n_kv, nt]
+
+    const int64_t nd  = ik->ne[0];
+    const int64_t nkv = ik->ne[1];
+    const int64_t nh  = q->ne[1];
+    const int64_t nt  = q->ne[2];
+
+    const float * qd = (const float *) q->data;
+    const float * wd = (const float *) w->data;
+
+    // parallelize over the cached positions
+    const int64_t ds = (nkv + params->nth - 1)/params->nth;
+    const int64_t s0 = ds*params->ith;
+    const int64_t s1 = MIN(s0 + ds, nkv);
+
+    for (int64_t s = s0; s < s1; ++s) {
+        const char * ik_row = (const char *) ik->data + s*ik->nb[1];
+
+        for (int64_t t = 0; t < nt; ++t) {
+            float acc = 0.0f;
+            for (int64_t h = 0; h < nh; ++h) {
+                const float * qh = qd + (t*nh + h)*nd;
+                float dot = 0.0f;
+                if (ik->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * ikd = (const ggml_fp16_t *) ik_row;
+                    for (int64_t d = 0; d < nd; ++d) {
+                        dot += GGML_CPU_FP16_TO_FP32(ikd[d])*qh[d];
+                    }
+                } else {
+                    const float * ikd = (const float *) ik_row;
+                    for (int64_t d = 0; d < nd; ++d) {
+                        dot += ikd[d]*qh[d];
+                    }
+                }
+                acc += wd[t*nh + h]*(dot > 0.0f ? dot : 0.0f);
+            }
+
+            float m;
+            if (mask->type == GGML_TYPE_F16) {
+                m = GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) ((const char *) mask->data + t*mask->nb[1]))[s]);
+            } else {
+                m = ((const float *) ((const char *) mask->data + t*mask->nb[1]))[s];
+            }
+
+            ((float *) dst->data)[t*nkv + s] = acc + m;
+        }
+    }
+}
+
 // ggml_compute_tri
 
 static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggml_tensor * dst) {

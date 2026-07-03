@@ -1049,6 +1049,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FILL",
     "SINKHORN",
     "HC_MIX",
+    "DSA_SCORE",
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
@@ -1080,7 +1081,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1162,6 +1163,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "fill(x, c)",
     "sinkhorn(x)",
     "hc_mix(x)",
+    "dsa_score(x)",
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
@@ -1193,7 +1195,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5340,6 +5342,37 @@ struct ggml_tensor * ggml_hc_mix(
     result->src[0] = a;
     result->src[1] = scale;
     result->src[2] = base;
+
+    return result;
+}
+
+// ggml_dsa_score
+
+struct ggml_tensor * ggml_dsa_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ik,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * mask) {
+    GGML_ASSERT(ik->type == GGML_TYPE_F16 || ik->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->type  == GGML_TYPE_F32 && ggml_is_contiguous(q));
+    GGML_ASSERT(w->type  == GGML_TYPE_F32 && ggml_is_contiguous(w));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(mask));
+
+    GGML_ASSERT(ik->ne[0]   == q->ne[0]);  // d
+    GGML_ASSERT(w->ne[0]    == q->ne[1]);  // h
+    GGML_ASSERT(w->ne[1]    == q->ne[2]);  // nt
+    GGML_ASSERT(mask->ne[0] == ik->ne[1]); // n_kv
+    GGML_ASSERT(mask->ne[1] >= q->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ik->ne[1], q->ne[2]);
+
+    result->op     = GGML_OP_DSA_SCORE;
+    result->src[0] = ik;
+    result->src[1] = q;
+    result->src[2] = w;
+    result->src[3] = mask;
 
     return result;
 }

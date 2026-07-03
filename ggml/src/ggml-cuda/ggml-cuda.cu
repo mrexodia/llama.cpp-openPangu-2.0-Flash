@@ -66,6 +66,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/sinkhorn.cuh"
+#include "ggml-cuda/dsa-score.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3125,6 +3126,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_HC_MIX:
             ggml_cuda_op_hc_mix(ctx, dst);
             break;
+        case GGML_OP_DSA_SCORE:
+            ggml_cuda_op_dsa_score(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5469,6 +5473,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FILL:
         case GGML_OP_SINKHORN:
         case GGML_OP_HC_MIX:
+        case GGML_OP_DSA_SCORE:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
