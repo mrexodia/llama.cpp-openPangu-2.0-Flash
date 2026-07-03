@@ -46,8 +46,11 @@ DGX Spark (GB10, unified memory):
 
 | llama-server, Q4_K_M | short | @10K | @24K | @100K |
 |---|---|---|---|---|
-| Prompt processing | — | 525 t/s | 359 t/s | 134 t/s |
+| Prompt processing | n/a¹ | 525 t/s | 359 t/s | 134 t/s |
 | Generation | ~25 t/s | 21.5 t/s | 18.4 t/s | 10.4 t/s |
+
+¹ prompt-processing throughput is not meaningful for very short prompts (dominated by
+fixed per-request overhead) — see `pp512` above.
 
 Quality (perplexity on clean English prose, `-c 2048`): Q4_K_M **3.45**, Q3_K_M **3.70**.
 Needle-in-a-haystack retrieval validated at 10K, 24K and 100K tokens. MTP drafting reaches
