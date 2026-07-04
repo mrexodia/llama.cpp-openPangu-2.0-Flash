@@ -909,9 +909,10 @@ static std::string common_chat_template_direct_apply_impl(
             inp[k] = v;
         }
     }
-    if (inputs.add_generation_prompt) {
-        inp["add_generation_prompt"] = true;
-    }
+    // always set explicitly: templates that default an undefined add_generation_prompt
+    // to true (e.g. openPangu) would otherwise render identical output for both the
+    // with- and without-generation-prompt passes, yielding an empty generation prompt
+    inp["add_generation_prompt"] = inputs.add_generation_prompt;
     if (inp.contains("preserve_reasoning") && inp["preserve_reasoning"].is_boolean()) {
         bool enabled = inp["preserve_reasoning"].get<bool>();
         jinja::caps_apply_preserve_reasoning(ctx, enabled);
