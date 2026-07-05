@@ -18,11 +18,24 @@ struct hf_file {
 
 using hf_files = std::vector<hf_file>;
 
+struct hf_ref {
+    std::string repo_id;
+    std::string branch;
+    std::string commit;
+};
+
 // Get files from HF API
+// if ref is non-null, it receives the resolved branch/commit; pass it to
+// update_ref() once all files are finalized
 hf_files get_repo_files(
     const std::string & repo_id,
-    const std::string & token
+    const std::string & token,
+    hf_ref * ref = nullptr
 );
+
+// Write refs/<branch>; call only after the snapshot is complete, otherwise
+// the ref would point at a snapshot that does not exist on disk
+void update_ref(const hf_ref & ref);
 
 hf_files get_cached_files(const std::string & repo_id = {});
 

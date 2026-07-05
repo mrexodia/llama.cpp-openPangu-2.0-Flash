@@ -227,7 +227,8 @@ static nl::json api_get(const std::string & url,
 }
 
 static std::string get_repo_commit(const std::string & repo_id,
-                                   const std::string & token) {
+                                   const std::string & token,
+                                   hf_ref * ref) {
     try {
         auto endpoint = common_get_model_endpoint();
         auto json = api_get(endpoint + "api/models/" + repo_id + "/refs", token);
@@ -277,7 +278,11 @@ static std::string get_repo_commit(const std::string & repo_id,
             return {};
         }
 
-        safe_write_file(refs_path / name, commit);
+        // do not write refs/<name> here: the snapshot does not exist yet and
+        // an interrupted download would orphan any previous snapshot
+        if (ref) {
+            *ref = {repo_id, name, commit};
+        }
         return commit;
 
     } catch (const nl::json::exception & e) {
@@ -289,13 +294,14 @@ static std::string get_repo_commit(const std::string & repo_id,
 }
 
 hf_files get_repo_files(const std::string & repo_id,
-                        const std::string & token) {
+                        const std::string & token,
+                        hf_ref * ref) {
     if (!is_valid_repo_id(repo_id)) {
         LOG_WRN("%s: invalid repository: %s\n", __func__, repo_id.c_str());
         return {};
     }
 
-    std::string commit = get_repo_commit(repo_id, token);
+    std::string commit = get_repo_commit(repo_id, token, ref);
     if (commit.empty()) {
         LOG_WRN("%s: failed to resolve commit for %s\n", __func__, repo_id.c_str());
         return {};
@@ -366,6 +372,24 @@ hf_files get_repo_files(const std::string & repo_id,
     return files;
 }
 
+void update_ref(const hf_ref & ref) {
+    if (ref.branch.empty() ||
+        !is_valid_repo_id(ref.repo_id) || !is_valid_commit(ref.commit)) {
+        return;
+    }
+    fs::path refs_path = get_repo_path(ref.repo_id) / "refs";
+
+    if (!is_valid_subpath(refs_path, ref.branch)) {
+        LOG_WRN("%s: skip invalid branch: %s\n", __func__, ref.branch.c_str());
+        return;
+    }
+    try {
+        safe_write_file(refs_path / ref.branch, ref.commit);
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: %s\n", __func__, e.what());
+    }
+}
+
 static std::string get_cached_ref(const fs::path & repo_path) {
     fs::path refs_path = repo_path / "refs";
     if (!fs::is_directory(refs_path)) {
@@ -394,6 +418,24 @@ static std::string get_cached_ref(const fs::path & repo_path) {
         }
     }
     return fallback;
+}
+
+static fs::path find_newest_snapshot(const fs::path & snapshots_path) {
+    fs::path newest;
+    fs::file_time_type newest_time;
+
+    for (const auto & entry : fs::directory_iterator(snapshots_path)) {
+        if (!entry.is_directory() ||
+            !is_valid_commit(entry.path().filename().string())) {
+            continue;
+        }
+        auto time = fs::last_write_time(entry);
+        if (newest.empty() || time > newest_time) {
+            newest      = entry.path();
+            newest_time = time;
+        }
+    }
+    return newest;
 }
 
 hf_files get_cached_files(const std::string & repo_id) {
@@ -430,7 +472,12 @@ hf_files get_cached_files(const std::string & repo_id) {
         fs::path commit_path = snapshots_path / commit;
 
         if (commit.empty() || !fs::is_directory(commit_path)) {
-            continue;
+            // the ref may point at a snapshot that was never downloaded;
+            // fall back to the newest snapshot present on disk
+            commit_path = find_newest_snapshot(snapshots_path);
+            if (commit_path.empty()) {
+                continue;
+            }
         }
         for (const auto & entry : fs::recursive_directory_iterator(commit_path)) {
             if (!entry.is_regular_file() && !entry.is_symlink()) {

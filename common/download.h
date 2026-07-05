@@ -108,5 +108,6 @@ struct common_download_hf_plan {
     hf_cache::hf_file mmproj;
     hf_cache::hf_file mtp;
     hf_cache::hf_file preset; // if set, only this file is downloaded
+    hf_cache::hf_ref ref;     // written to disk after all files are finalized
 };
 common_download_hf_plan common_download_get_hf_plan(const common_params_model & model, const common_download_opts & opts);

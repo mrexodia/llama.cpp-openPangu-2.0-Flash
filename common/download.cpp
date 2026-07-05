@@ -687,13 +687,15 @@ static void list_available_gguf_files(const hf_cache::hf_files & files) {
 common_download_hf_plan common_download_get_hf_plan(const common_params_model & model, const common_download_opts & opts) {
     common_download_hf_plan plan;
     hf_cache::hf_files all;
+    hf_cache::hf_ref ref;
 
     auto [repo, tag] = common_download_split_repo_tag(model.hf_repo);
 
     if (!opts.offline) {
-        all = hf_cache::get_repo_files(repo, opts.bearer_token);
+        all = hf_cache::get_repo_files(repo, opts.bearer_token, &ref);
     }
     if (all.empty()) {
+        ref = {}; // cached files may belong to a different commit
         all = hf_cache::get_cached_files(repo);
     }
     if (all.empty()) {
@@ -704,6 +706,7 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
     for (const auto & f : all) {
         if (f.path == "preset.ini") {
             plan.preset = f;
+            plan.ref = ref;
             return plan;
         }
     }
@@ -733,6 +736,7 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
 
     plan.primary = primary;
     plan.model_files = get_split_files(all, primary);
+    plan.ref = ref;
 
     if (opts.download_mmproj) {
         plan.mmproj = find_best_mmproj(all, primary.path);

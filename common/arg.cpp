@@ -570,6 +570,12 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             task.on_done();
         }
     }
+
+    // update refs last, so an interrupted download cannot leave them
+    // pointing at an incomplete snapshot
+    hf_cache::update_ref(plan.ref);
+    hf_cache::update_ref(plan_spec.ref);
+    hf_cache::update_ref(plan_voc.ref);
 }
 
 //
